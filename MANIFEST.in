@@ -1,0 +1,12 @@
+include README.md
+include LICENSE
+include requirements.txt
+include .env.example
+recursive-include cloudedge *.py
+recursive-include examples *.py *.md
+recursive-include tests *.py
+exclude cloudedge_api_flow.py
+exclude iot_parameters.py
+exclude results.txt
+exclude .cloudedge_session_cache
+exclude .home_id

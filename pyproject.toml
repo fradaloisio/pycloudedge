@@ -1,0 +1,112 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycloudedge"
+dynamic = ["version"]
+description = "Python library for CloudEdge cameras"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Francesco D'Aloisio"},
+]
+maintainers = [
+    {name = "Francesco D'Aloisio"},
+]
+keywords = ["cloudedge", "smarteye", "cameras", "iot", "api", "home-automation", "homeassistant"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "requests>=2.25.0",
+    "cryptography>=3.4.0",
+    "python-dotenv>=0.19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-asyncio>=0.18.0",
+    "black>=21.0.0",
+    "flake8>=3.8.0",
+    "mypy>=0.910",
+    "twine>=3.4.0",
+    "build>=0.7.0",
+]
+examples = [
+    "python-dotenv>=0.19.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/fradaloisio/pycloudedge"
+"Bug Reports" = "https://github.com/fradaloisio/pycloudedge/issues"
+"Source" = "https://github.com/fradaloisio/pycloudedge"
+"Documentation" = "https://pycloudedge.readthedocs.io/"
+
+[project.scripts]
+cloudedge = "cloudedge.cli:main"
+
+[tool.setuptools_scm]
+write_to = "cloudedge/_version.py"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cloudedge*"]
+exclude = ["tests*"]
+
+[tool.black]
+line-length = 88
+target-version = ['py37']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.7"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers"
+testpaths = [
+    "tests",
+]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
