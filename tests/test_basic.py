@@ -12,7 +12,6 @@ import os
 import asyncio
 from unittest.mock import Mock, patch, AsyncMock
 import sys
-import os
 
 # Add the parent directory to the path so we can import cloudedge
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
