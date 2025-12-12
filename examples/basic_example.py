@@ -51,7 +51,9 @@ def main():
             password=password,
             country_code=country_code,
             phone_code=phone_code,
-            debug=True
+            debug=False
+            , log_signature_debug=True
+            , use_epoch_timestamp=True
         )
         
         # Authenticate
@@ -69,7 +71,9 @@ def main():
             homes = client.get_homes()
             print(f"Found {len(homes)} home(s):")
             for i, home in enumerate(homes, 1):
-                print(f"  {i}. {home['name']} (ID: {home['home_id']})")
+                # If the home name is empty / 'Unnamed', display the home ID to help debugging
+                display_name = home['name'] if home['name'] and home['name'] != 'Unnamed' else f"(ID: {home['home_id']})"
+                print(f"  {i}. {display_name} (ID: {home['home_id']})")
                 print(f"     Owner: {home['owner']}")
                 print(f"     Rooms: {home['rooms']}, Devices: {home['device_count']}")
             print()
@@ -78,7 +82,9 @@ def main():
             print()
         
         # Try different device retrieval methods
+        # If one method finds devices, don't run subsequent methods
         print("📱 Getting devices...")
+        found_devices = False
         
         # Method 1: Try default home API
         print("1. Trying default home API...")
@@ -86,6 +92,7 @@ def main():
             devices = client.get_devices()
             if devices:
                 print(f"   ✅ Found {len(devices)} devices via default home API")
+                found_devices = True
                 for device in devices:
                     status = "🟢 Online" if device['online'] else "🔴 Offline"
                     print(f"   - {device['name']} ({device['type']}) - {status}")
@@ -94,36 +101,38 @@ def main():
         except Exception as e:
             print(f"   ❌ Default home API failed: {e}")
         print()
-        
+
         # Method 2: Get all devices from all homes
-        print("2. Trying all homes approach...")
-        try:
-            all_devices = client.get_all_devices()
-            if all_devices:
-                print(f"   ✅ Found {len(all_devices)} devices from all homes")
-                for device in all_devices:
-                    status = "🟢 Online" if device['online'] else "🔴 Offline"
-                    home_info = f" (Home: {device.get('home_id', 'N/A')})" if device.get('home_id') else ""
-                    print(f"   - {device['name']} ({device['type']}) - {status}{home_info}")
-            else:
-                print("   ❌ No devices found from all homes")
-        except Exception as e:
-            print(f"   ❌ All homes approach failed: {e}")
-        print()
-        
+        if not found_devices:
+            print("2. Trying all homes approach...")
+            try:
+                all_devices = client.get_all_devices()
+                if all_devices:
+                    print(f"   ✅ Found {len(all_devices)} devices from all homes")
+                    found_devices = True
+                    for device in all_devices:
+                        status = "🟢 Online" if device['online'] else "🔴 Offline"
+                        home_info = f" (Home: {device.get('home_id', 'N/A')})" if device.get('home_id') else ""
+                        print(f"   - {device['name']} ({device['type']}) - {status}{home_info}")
+                else:
+                    print("   ❌ No devices found from all homes")
+            except Exception as e:
+                print(f"   ❌ All homes approach failed: {e}")
+                print()
         # Method 3: Get devices by specific home (if homes were found)
-        if 'homes' in locals() and homes:
+        if 'homes' in locals() and homes and not found_devices:
             print("3. Trying specific home...")
             first_home = homes[0]
+            display_name_for_home = first_home['name'] if first_home['name'] and first_home['name'] != 'Unnamed' else f"(ID: {first_home['home_id']})"
             try:
                 home_devices = client.get_devices_by_home(first_home['home_id'])
                 if home_devices:
-                    print(f"   ✅ Found {len(home_devices)} devices in home '{first_home['name']}'")
+                    print(f"   ✅ Found {len(home_devices)} devices in home '{display_name_for_home}'")
                     for device in home_devices:
                         status = "🟢 Online" if device['online'] else "🔴 Offline"
                         print(f"   - {device['name']} ({device['type']}) - {status}")
                 else:
-                    print(f"   ❌ No devices found in home '{first_home['name']}'")
+                    print(f"   ❌ No devices found in home '{display_name_for_home}'")
             except Exception as e:
                 print(f"   ❌ Home-specific approach failed: {e}")
             print()

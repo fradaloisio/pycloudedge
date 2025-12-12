@@ -7,6 +7,8 @@ Simple tests to verify library functionality.
 """
 
 import unittest
+import tempfile
+import os
 import asyncio
 from unittest.mock import Mock, patch, AsyncMock
 import sys
@@ -44,18 +46,29 @@ class TestIoTParameters(unittest.TestCase):
         self.assertEqual(format_parameter_value("UNKNOWN_PARAM", "test"), "test")
 
 
-class TestCloudEdgeClient(unittest.TestCase):
+class TestCloudEdgeClient(unittest.IsolatedAsyncioTestCase):
     """Test CloudEdge client functionality."""
     
     def setUp(self):
         """Set up test client."""
+        # Use a per-test temporary session cache file to avoid shared state
+        self.session_cache_file = tempfile.NamedTemporaryFile(delete=False).name
         self.client = CloudEdgeClient(
             username="test@example.com",
             password="testpass",
             country_code="US",
             phone_code="+1",
             debug=False
+            , session_cache_file=self.session_cache_file
         )
+
+    def tearDown(self):
+        # Remove temporary cache file if exists
+        try:
+            if os.path.exists(self.session_cache_file):
+                os.remove(self.session_cache_file)
+        except Exception:
+            pass
     
     def test_client_initialization(self):
         """Test client initialization."""
@@ -64,6 +77,11 @@ class TestCloudEdgeClient(unittest.TestCase):
         self.assertEqual(self.client.phone_code, "+1")
         self.assertFalse(self.client.debug)
         self.assertIsNone(self.client.session_data)
+        # Country code US must try to set base URLs for US region by default.
+        from cloudedge.constants import REGION_URLS
+        expected = REGION_URLS.get("US")
+        self.assertEqual(self.client.BASE_URL, expected["BASE_URL"])
+        self.assertEqual(self.client.OPENAPI_BASE_URL, expected["OPENAPI_BASE_URL"])
     
     def test_format_sn(self):
         """Test serial number formatting."""
@@ -75,9 +93,113 @@ class TestCloudEdgeClient(unittest.TestCase):
         
         # Test empty SN
         self.assertEqual(self.client._format_sn(""), "")
+
+    def test_explicit_region_argument(self):
+        from cloudedge.constants import REGION_URLS
+        client_eu = CloudEdgeClient("test@example.com", "testpass", "IT", "+39", region="EU")
+        self.assertEqual(client_eu.BASE_URL, REGION_URLS.get("EU")["BASE_URL"])
+
+        client_us = CloudEdgeClient("test@example.com", "testpass", "US", "+1", region="US")
+        self.assertEqual(client_us.BASE_URL, REGION_URLS.get("US")["BASE_URL"])
+
+    def test_authenticate_updates_base_url_from_server(self):
+        """If login response includes an 'apiServer', the client should adopt it."""
+        client = CloudEdgeClient("test@example.com", "testpass", "US", "+1")
+
+        # Mock authenticate flow; patch session.request used by _make_request for the home list call
+        from unittest.mock import Mock
+        mock_response_login = Mock()
+        mock_response_login.status_code = 200
+        mock_response_login.json.return_value = {
+            "resultCode": "1001",
+            "result": {
+                "userToken": "test_token",
+                "userID": "test_user_id",
+                "apiServer": "https://apis.cloudedge360.com",
+                "iot": {"pfKey": {"accessid": "test_access_id", "accesskey": "test_access_key"}}
+            }
+        }
+        mock_response_login.raise_for_status.return_value = None
+
+        with patch('cloudedge.client.requests.Session.request', return_value=mock_response_login):
+            success = client.authenticate()
+            self.assertTrue(success)
+            self.assertEqual(client.BASE_URL, "https://apis.cloudedge360.com")
+
+    def test_explicit_base_url_override(self):
+        client_custom = CloudEdgeClient("test@example.com", "testpass", "US", "+1", base_url="https://example.invalid", openapi_base_url="https://example.invalid")
+        self.assertEqual(client_custom.BASE_URL, "https://example.invalid")
+        self.assertEqual(client_custom.OPENAPI_BASE_URL, "https://example.invalid")
+
+    def test_get_devices_uses_base_url(self):
+        """Ensure get_devices uses the correct BASE_URL endpoint."""
+        from unittest.mock import Mock
+        # Use a client with US region
+        client = CloudEdgeClient("test@example.com", "testpass", "US", "+1")
+        client.session_data = {"userToken": "t", "userID": "id"}
+
+        # Mock response
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"resultCode": "1001", "result": {"deviceList": []}}
+        mock_response.raise_for_status.return_value = None
+
+        with patch('cloudedge.client.requests.Session.request', return_value=mock_response) as mock_request:
+            client.get_devices()
+            # Verify the request was made to the correct URL
+            called_url = mock_request.call_args[0][1]
+            self.assertTrue(called_url.startswith(client.BASE_URL))
+            # No X-Ca headers are required for the default devices API; if
+            # present they will be validated by other tests.
+
+    def test_get_device_config_uses_openapi_base_url(self):
+        """Ensure get_device_config uses the OPENAPI_BASE_URL endpoint."""
+        from unittest.mock import Mock
+        client = CloudEdgeClient("test@example.com", "testpass", "US", "+1")
+        # Provide OpenAPI credentials in session data
+        client.session_data = {"userToken": "t", "userID": "id", "iotPlatformKeys": {"accessid": "aid", "accesskey": "akey"}}
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"code": 100001, "data": {}}
+        mock_response.raise_for_status.return_value = None
+
+        with patch('cloudedge.client.requests.Session.request', return_value=mock_response) as mock_request:
+            client.get_device_config("SN123456789")
+            called_url = mock_request.call_args[0][1]
+            self.assertTrue(called_url.startswith(client.OPENAPI_BASE_URL))
+            headers = mock_request.call_args[1]['headers']
+            from cloudedge.constants import CA_KEY
+            self.assertEqual(headers.get('X-Ca-Key'), CA_KEY)
+
+    def test_get_devices_fallback_to_eu(self):
+        """If the first request fails, ensure fallback to EU endpoint is tried and returns success."""
+        client = CloudEdgeClient("test@example.com", "testpass", "US", "+1")
+        client.session_data = {"userToken": "t", "userID": "id"}
+
+        # First request raises RequestException; second returns success
+        from requests.exceptions import RequestException
+        from unittest.mock import Mock
+        mock_success = Mock()
+        mock_success.status_code = 200
+        mock_success.json.return_value = {"resultCode": "1001", "result": {"deviceList": []}}
+        mock_success.raise_for_status.return_value = None
+
+        side_effects = [RequestException("Network error"), mock_success]
+
+        with patch('cloudedge.client.requests.Session.request', side_effect=side_effects) as mock_request:
+            devices = client.get_devices()
+            self.assertIsInstance(devices, list)
+            # We expect two calls: first attempt to US URL, second attempt to EU fallback
+            self.assertEqual(mock_request.call_count, 2)
+            # Ensure the first call included userToken in the POST data (default devices API uses POST)
+            first_call_kwargs = mock_request.call_args_list[0][1]
+            # The device_body should include userToken
+            if 'data' in first_call_kwargs:
+                self.assertIn('userToken', first_call_kwargs['data'])
     
-    @patch('cloudedge.client.requests.Session.post')
-    async def test_authenticate_success(self, mock_post):
+    @patch('cloudedge.client.requests.Session.request')
+    def test_authenticate_success(self, mock_post):
         """Test successful authentication."""
         # Mock successful login response
         mock_response = Mock()
@@ -99,15 +221,15 @@ class TestCloudEdgeClient(unittest.TestCase):
         mock_post.return_value = mock_response
         
         # Test authentication
-        success = await self.client.authenticate()
+        success = self.client.authenticate()
         
         self.assertTrue(success)
         self.assertIsNotNone(self.client.session_data)
         self.assertEqual(self.client.session_data["userToken"], "test_token")
         self.assertEqual(self.client.session_data["userID"], "test_user_id")
     
-    @patch('cloudedge.client.requests.Session.post')
-    async def test_authenticate_failure(self, mock_post):
+    @patch('cloudedge.client.requests.Session.request')
+    def test_authenticate_failure(self, mock_post):
         """Test failed authentication."""
         # Mock failed login response
         mock_response = Mock()
@@ -121,15 +243,15 @@ class TestCloudEdgeClient(unittest.TestCase):
         
         # Test authentication failure
         with self.assertRaises(AuthenticationError):
-            await self.client.authenticate()
+            self.client.authenticate()
     
     async def test_get_devices_not_authenticated(self):
         """Test getting devices without authentication."""
         with self.assertRaises(AuthenticationError):
             await self.client.get_devices()
     
-    @patch('cloudedge.client.requests.Session.post')
-    async def test_get_devices_success(self, mock_post):
+    @patch('cloudedge.client.requests.Session.request')
+    def test_get_devices_success(self, mock_post):
         """Test successful device retrieval."""
         # Set up authenticated session
         self.client.session_data = {
@@ -160,7 +282,7 @@ class TestCloudEdgeClient(unittest.TestCase):
         mock_post.return_value = mock_response
         
         # Test device retrieval
-        devices = await self.client.get_devices()
+        devices = self.client.get_devices()
         
         self.assertEqual(len(devices), 1)
         device = devices[0]
@@ -168,11 +290,11 @@ class TestCloudEdgeClient(unittest.TestCase):
         self.assertEqual(device["name"], "Test Camera")
         self.assertTrue(device["online"])
     
-    async def test_find_device_by_name_not_authenticated(self):
+    def test_find_device_by_name_not_authenticated(self):
         """Test finding device without authentication."""
-        # Mock get_devices to raise AuthenticationError
-        with patch.object(self.client, 'get_devices', side_effect=AuthenticationError("Not authenticated")):
-            result = await self.client.find_device_by_name("Test Device")
+        # Mock get_all_devices to raise AuthenticationError
+        with patch.object(self.client, 'get_all_devices', side_effect=AuthenticationError("Not authenticated")):
+            result = self.client.find_device_by_name("Test Device")
             self.assertIsNone(result)
 
 
@@ -181,7 +303,7 @@ class TestAsyncMethods(unittest.IsolatedAsyncioTestCase):
     
     async def test_client_methods_with_mock(self):
         """Test client methods with mocked dependencies."""
-        client = CloudEdgeClient("test", "test", "US", "+1")
+        client = CloudEdgeClient("test@example.com", "test", "US", "+1")
         
         # Test that methods require authentication
         with self.assertRaises(AuthenticationError):

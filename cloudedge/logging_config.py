@@ -43,4 +43,8 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
         Logger instance
     """
     logger_name = f"pycloudedge.{name}" if name else "pycloudedge"
+    # Ensure the root pycloudedge logger has been configured with a handler
+    root_logger = logging.getLogger('pycloudedge')
+    if not root_logger.handlers:
+        setup_logger('pycloudedge', level=logging.INFO)
     return logging.getLogger(logger_name)

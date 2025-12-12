@@ -210,7 +210,8 @@ class TestPhase3CodeDuplication:
         mock_time.return_value = 1000000.0
         
         client = CloudEdgeClient("user@example.com", "password", "US", "+1")
-        client.session_data = {"userToken": "test_token"}
+        # Simulate server-provided caKey in session_data
+        client.session_data = {"userToken": "test_token", "caKey": "test_token"}
         
         headers = client._generate_xca_headers("test_params", "test_token")
         

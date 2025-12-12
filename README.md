@@ -580,6 +580,6 @@ This library is currently in **beta**. While it provides an interface for intera
 
 - **Status Reliability**: The API always shows the camera as online, which may not reflect the actual status.
 - **Refresh Reliability**: The API refreshes only after some time when the CloudEdge app is not opened on the phone. This does not impact device control.
-- **Regional Support**: Currently, only European accounts are supported. Work is in progress to dynamically gather `BASE_URL` and `OPENAPI_BASE_URL` for other regions.
+- **Regional Support**: The library now supports both European and US regions; default is EU. You can specify a region by passing the `region` argument (`EU` or `US`) to the `CloudEdgeClient`, or provide explicit `base_url` and `openapi_base_url` overrides if needed. Work continues to support automatic region detection and additional regions.
 
 We appreciate your understanding and welcome feedback to improve the library.

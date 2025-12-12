@@ -35,9 +35,15 @@ from .iot_parameters import (
     get_parameter_code_by_name, 
     format_parameter_value
 )
-from .constants import CA_KEY, DEFAULT_HEADERS, DEFAULT_TIMEOUT
-from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
+from .validators import validate_email, validate_country_code, validate_phone_code
+from .constants import (
+    CA_KEY,
+    DEFAULT_HEADERS,
+    DEFAULT_TIMEOUT,
+    TYPE_REGION_EU,
+    get_urls_for_region,
+)
 from .utils import retry_on_failure
 
 
@@ -76,7 +82,12 @@ class CloudEdgeClient:
         debug: bool = False,
         session_cache_file: str = ".cloudedge_session_cache",
         enable_network_ping: bool = True,
-        ping_timeout: float = 2.0
+        ping_timeout: float = 2.0,
+        region: Optional[str] = None,
+        base_url: Optional[str] = None,
+        openapi_base_url: Optional[str] = None,
+        log_signature_debug: bool = False,
+        use_epoch_timestamp: bool = False,
     ):
         """
         Initialize CloudEdge API client.
@@ -90,6 +101,11 @@ class CloudEdgeClient:
             session_cache_file (str): Path to session cache file
             enable_network_ping (bool): Enable ping-based online status when on same network
             ping_timeout (float): Ping timeout in seconds
+            region (Optional[str]): Region code ("US" or "EU"). If not provided, inferred from country_code.
+            base_url (Optional[str]): Override base URL for API requests
+            openapi_base_url (Optional[str]): Override OpenAPI base URL
+            log_signature_debug (bool): Log signature debug information (masked)
+            use_epoch_timestamp (bool): Use epoch milliseconds for timestamp fields
             
         Raises:
             ValidationError: If input validation fails
@@ -124,6 +140,11 @@ class CloudEdgeClient:
             self.logger.setLevel(logging.DEBUG)
         self.debug = debug
         
+        # Signature logging flag (masked output)
+        self.log_signature_debug = log_signature_debug
+        # Use epoch milliseconds for 'timestamp' fields on v1 endpoints
+        self.use_epoch_timestamp = use_epoch_timestamp
+        
         self.session_cache_file = session_cache_file
         self.enable_network_ping = enable_network_ping
         self.ping_timeout = ping_timeout
@@ -135,6 +156,25 @@ class CloudEdgeClient:
         # Network detection cache
         self._local_network = None
         self._network_detected = False
+        
+        # Resolve base URLs for region; priority: explicit args -> region mapping -> defaults
+        if base_url:
+            self.BASE_URL = base_url
+        else:
+            # region may be explicitly provided by user or inferred from country_code
+            resolved_region = region or ("US" if self.country_code == "US" else TYPE_REGION_EU)
+            urls = get_urls_for_region(resolved_region)
+            self.BASE_URL = urls.get("BASE_URL")
+
+        if openapi_base_url:
+            self.OPENAPI_BASE_URL = openapi_base_url
+        else:
+            # Use the same region resolution
+            urls = get_urls_for_region(region or ("US" if self.country_code == "US" else TYPE_REGION_EU))
+            self.OPENAPI_BASE_URL = urls.get("OPENAPI_BASE_URL")
+
+        if self.debug:
+            self._log(f"Using BASE_URL={self.BASE_URL} OPENAPI_BASE_URL={self.OPENAPI_BASE_URL}")
         
     def _detect_local_network(self) -> Optional[str]:
         """Detect the local network subnet."""
@@ -302,7 +342,12 @@ class CloudEdgeClient:
         self.logger.error(message)
     
     def _generate_xca_headers(self, params_str: str = "", user_token: Optional[str] = None) -> Dict[str, str]:
-        """Generate X-Ca headers for authenticated API requests."""
+        """Generate X-Ca headers for authenticated API requests.
+        
+        The CA key used will prefer the per-session caKey if it was provided by
+        the login response (session_data['caKey']), otherwise it falls back to
+        the default CA_KEY constant from the library.
+        """
         if user_token is None:
             user_token = self.session_data.get('userToken', '') if self.session_data else ''
         
@@ -316,10 +361,26 @@ class CloudEdgeClient:
             ).digest()
         ).decode()
         
+        # Prefer server-provided caKey if the server returned one at login
+        ca_key = None
+        if self.session_data and isinstance(self.session_data, dict):
+            ca_key = self.session_data.get('caKey')
+        if not ca_key:
+            ca_key = CA_KEY
+        
+        # Debug logs: masked signature and CA key
+        if (self.debug or getattr(self, 'log_signature_debug', False)) and params_str:
+            try:
+                masked = ca_signature[:8] + "..."
+                self._log(f"X-Ca-Sign (masked): {masked}")
+                self._log(f"X-Ca-Key used: {ca_key}")
+            except Exception:
+                pass
+        
         return {
             "X-Ca-Timestamp": ca_timestamp,
             "X-Ca-Sign": ca_signature,
-            "X-Ca-Key": user_token,
+            "X-Ca-Key": ca_key,
             "X-Ca-Nonce": ca_nonce
         }
     
@@ -349,6 +410,9 @@ class CloudEdgeClient:
         
     def _generate_url_timestamp(self) -> str:
         """Generate URL-encoded timestamp."""
+        if getattr(self, 'use_epoch_timestamp', False):
+            # Return epoch ms as string (not quoted)
+            return str(int(time.time() * 1000))
         return quote(self._generate_timestamp())
         
     def _get_timeout(self) -> str:
@@ -364,15 +428,21 @@ class CloudEdgeClient:
         return sn[4:] if len(sn) > 4 else sn
         
     def _des_encode(self, password: str) -> str:
-        """Encrypt password using 3DES."""
+        """Encrypt password using 3DES.
+        
+        Note: TripleDES is required for CloudEdge protocol compatibility.
+        Using the new decrepit module path to avoid deprecation warnings.
+        """
         key = "123456781234567812345678".encode('utf-8')
         iv = "01234567".encode('utf-8')
         
         try:
-            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives.ciphers import Cipher, modes
             from cryptography.hazmat.primitives import padding
+            # Import from the new decrepit module location
+            from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
 
-            algorithm = algorithms.TripleDES(key)
+            algorithm = TripleDES(key)
             cipher = Cipher(algorithm, modes.CBC(iv))
             encryptor = cipher.encryptor()
             
@@ -412,7 +482,7 @@ class CloudEdgeClient:
         except Exception as e:
             raise CloudEdgeError(f"Error during username encryption: {e}")
             
-    def _generate_api_signature(self, params_str: str, user_token: str) -> str:
+    def _generate_api_signature(self, params_str: str, secret: str) -> str:
         """Generate HMAC-SHA1 signature."""
         from urllib.parse import unquote
         
@@ -428,12 +498,24 @@ class CloudEdgeClient:
         string_to_sign = "&".join(parts)
         
         signature_bytes = hmac.new(
-            user_token.encode('utf-8'),
+            secret.encode('utf-8'),
             string_to_sign.encode('utf-8'),
             hashlib.sha1
         ).digest()
         
-        return base64.b64encode(signature_bytes).decode('utf-8')
+        signature = base64.b64encode(signature_bytes).decode('utf-8')
+        
+        # Masked logging of signature and partial string-to-sign for debugging
+        if (self.debug or getattr(self, 'log_signature_debug', False)) and string_to_sign:
+            try:
+                masked_sig = signature[:8] + '...'
+                masked_str = string_to_sign[:80] + '...'
+                self._log(f"Generated API signature (masked): {masked_sig}")
+                self._log(f"String to sign (partial): {masked_str}")
+            except Exception:
+                pass
+        
+        return signature
         
     def _get_signature_for_openapi(self, url_path: str, action_type: str, secret: str) -> tuple:
         """Generate signature for OpenAPI requests."""
@@ -646,20 +728,13 @@ class CloudEdgeClient:
         timestamp = self._generate_url_timestamp()
         nonce = int(time.time())
         
+        # Include userToken in params_str - this is required for the simple signature to work
         params_str = (
             f"appVer=5.5.1&appVerCode=551&lngType=en&phoneType=a&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
             f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
-            f"userID={self.session_data['userID']}"
+            f"userID={self.session_data['userID']}&userToken={self.session_data['userToken']}"
         )
-        
-        signature = self._generate_api_signature(params_str, self.session_data['userToken'])
-        if not signature:
-            raise CloudEdgeError("Failed to generate signature for home list")
-            
-        signature_encoded = quote(signature)
-        
-        url = f"{self.BASE_URL}/v1/app/home/list?{params_str}&signature={signature_encoded}"
         
         # Generate X-Ca headers for authenticated requests
         xca_headers = self._generate_xca_headers(params_str, self.session_data['userToken'])
@@ -671,14 +746,14 @@ class CloudEdgeClient:
         }
         headers.update(xca_headers)
         
+        # Use the simple signature with userToken
+        signature = self._generate_api_signature(params_str, self.session_data.get('userToken'))
+        signature_encoded = quote(signature)
+        url = f"{self.BASE_URL}/v1/app/home/list?{params_str}&signature={signature_encoded}"
+        
         try:
             response = self._make_request('GET', url, headers=headers, timeout=DEFAULT_TIMEOUT)
             response_data = response.json()
-            
-            # Log the actual response for debugging
-            self._log(f"Homes API response: {response_data}")
-            result_code = response_data.get("resultCode")
-            self._log(f"Result code: {result_code}, type: {type(result_code)}")
             
             if response_data.get("resultCode") == "1001":
                 self._log("Homes retrieved successfully!")
@@ -689,10 +764,11 @@ class CloudEdgeClient:
                 for home in home_list:
                     rooms = home.get('rooms', [])
                     device_count = sum(len(room.get('devices', [])) for room in rooms)
-                    
+                    # Normalize home name: some backends return empty string for homeName
+                    home_name = home.get('homeName') or home.get('name') or 'Unnamed'
                     homes.append({
                         'home_id': home.get('homeID'),
-                        'name': home.get('homeName', 'Unnamed'),
+                        'name': home_name,
                         'owner': home.get('owner'),
                         'rooms': len(rooms),
                         'device_count': device_count
@@ -702,13 +778,37 @@ class CloudEdgeClient:
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
-                self._log(f"API error - Code: {error_code}, Message: {error_msg}, Full response: {response_data}")
+                self._log(f"API error - Code: {error_code}, Message: {error_msg}")
                 raise CloudEdgeError(
                     f"Failed to retrieve homes: {error_msg} (Code: {error_code})",
-                    details={"error_code": error_code, "message": error_msg, "response": response_data}
+                    details={"error_code": error_code, "message": error_msg}
                 )
                 
         except requests.exceptions.RequestException as e:
+            # Fallback to EU endpoint if request failed
+            try:
+                eu_urls = get_urls_for_region(TYPE_REGION_EU)
+                eu_url = f"{eu_urls['BASE_URL']}/v1/app/home/list?{params_str}&signature={signature_encoded}"
+                self._log(f"Home list request failed on {self.BASE_URL}: {e}; retrying on EU URL")
+                response = self._make_request('GET', eu_url, headers=headers, timeout=DEFAULT_TIMEOUT)
+                response_data = response.json()
+                if response_data.get("resultCode") == "1001":
+                    homes = []
+                    home_list = response_data.get('result', {}).get('homes', [])
+                    for home in home_list:
+                        rooms = home.get('rooms', [])
+                        device_count = sum(len(room.get('devices', [])) for room in rooms)
+                        home_name = home.get('homeName') or home.get('name') or 'Unnamed'
+                        homes.append({
+                            'home_id': home.get('homeID'),
+                            'name': home_name,
+                            'owner': home.get('owner'),
+                            'rooms': len(rooms),
+                            'device_count': device_count
+                        })
+                    return homes
+            except Exception:
+                pass
             raise NetworkError(f"Home list request failed: {e}")
         except json.JSONDecodeError:
             raise CloudEdgeError("Failed to parse home list response")
@@ -735,20 +835,13 @@ class CloudEdgeClient:
         timestamp = self._generate_url_timestamp()
         nonce = int(time.time())
         
+        # Include userToken in params_str - required for the simple signature to work
         params_str = (
             f"appVer=5.5.1&appVerCode=551&homeID={home_id}&lngType=en&phoneType=a&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
             f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
-            f"userID={self.session_data['userID']}"
+            f"userID={self.session_data['userID']}&userToken={self.session_data['userToken']}"
         )
-        
-        signature = self._generate_api_signature(params_str, self.session_data['userToken'])
-        if not signature:
-            raise CloudEdgeError("Failed to generate signature for device list")
-            
-        signature_encoded = quote(signature)
-        
-        url = f"{self.BASE_URL}/v1/app/home/join/device/list?{params_str}&signature={signature_encoded}"
         
         # Generate X-Ca headers for authenticated requests
         xca_headers = self._generate_xca_headers(params_str, self.session_data['userToken'])
@@ -760,38 +853,67 @@ class CloudEdgeClient:
         }
         headers.update(xca_headers)
         
+        # Use the simple signature with userToken
+        signature = self._generate_api_signature(params_str, self.session_data.get('userToken'))
+        signature_encoded = quote(signature)
+        url = f"{self.BASE_URL}/v1/app/home/join/device/list?{params_str}&signature={signature_encoded}"
+        
+        def _parse_devices(response_data: Dict) -> List[Dict]:
+            """Parse devices from response data."""
+            devices = []
+            device_types = ['snap', 'nvr', 'ipc', 'chime', 'doorbell']
+            
+            # Check both top-level and result for device lists
+            sources = [response_data]
+            if isinstance(response_data.get('result'), dict):
+                sources.append(response_data.get('result'))
+            
+            raw_devices = []
+            for src in sources:
+                for device_type in device_types:
+                    if device_type in src and isinstance(src[device_type], list):
+                        raw_devices.extend(src[device_type])
+            
+            # Also check for deviceList format
+            if not raw_devices:
+                device_list = response_data.get('result', {}).get('deviceList', [])
+                if isinstance(device_list, list) and device_list:
+                    raw_devices.extend(device_list)
+            
+            # Normalize and deduplicate
+            seen = set()
+            for device in raw_devices:
+                serial = device.get('snNum') or device.get('devUid') or device.get('productSN') or str(device.get('deviceID'))
+                if not serial or serial in seen:
+                    continue
+                seen.add(serial)
+                device_name = device.get('deviceName') or 'Unnamed'
+                device_dict = {
+                    'device_id': device.get('deviceID'),
+                    'serial_number': serial,
+                    'name': device_name,
+                    'type': device.get('deviceTypeName', 'Unknown'),
+                    'type_id': device.get('devTypeID'),
+                    'host_key': device.get('hostKey'),
+                    'online': (
+                        (device.get('onLine') == 1) if 'onLine' in device else
+                        (device.get('devStatus') == 1) if 'devStatus' in device else
+                        (device.get('online') is True) if 'online' in device else False
+                    ),
+                    'home_id': home_id
+                }
+                device_dict['online'] = self._get_enhanced_device_status(device_dict)
+                devices.append(device_dict)
+            
+            return devices
+        
         try:
             response = self._make_request('GET', url, headers=headers, timeout=DEFAULT_TIMEOUT)
             response_data = response.json()
             
             if response_data.get("resultCode") in ["1001", "1107"]:
                 self._log("Home devices retrieved successfully!")
-                
-                devices = []
-                device_types = ['snap', 'nvr', 'ipc', 'chime', 'doorbell']
-                
-                for device_type in device_types:
-                    if device_type in response_data:
-                        device_list = response_data[device_type]
-                        if isinstance(device_list, list):
-                            for device in device_list:
-                                device_dict = {
-                                    'device_id': device.get('deviceID'),
-                                    'serial_number': device.get('snNum'),
-                                    'name': device.get('deviceName', 'Unnamed'),
-                                    'type': device.get('deviceTypeName', 'Unknown'),
-                                    'type_id': device.get('devTypeID'),
-                                    'host_key': device.get('hostKey'),
-                                    'online': device.get('devStatus') == 1,  # Store original API status
-                                    'home_id': home_id
-                                }
-                                
-                                # Get enhanced online status
-                                device_dict['online'] = self._get_enhanced_device_status(device_dict)
-                                
-                                devices.append(device_dict)
-                                
-                return devices
+                return _parse_devices(response_data)
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
@@ -801,6 +923,17 @@ class CloudEdgeClient:
                 )
                 
         except requests.exceptions.RequestException as e:
+            # Fallback to EU endpoint if request failed
+            try:
+                eu_urls = get_urls_for_region(TYPE_REGION_EU)
+                eu_url = f"{eu_urls['BASE_URL']}/v1/app/home/join/device/list?{params_str}&signature={signature_encoded}"
+                self._log(f"Home device list request failed on {self.BASE_URL}: {e}; retrying on EU URL")
+                response = self._make_request('GET', eu_url, headers=headers, timeout=DEFAULT_TIMEOUT)
+                response_data = response.json()
+                if response_data.get("resultCode") in ["1001", "1107"]:
+                    return _parse_devices(response_data)
+            except Exception:
+                pass
             raise NetworkError(f"Home device list request failed: {e}")
         except json.JSONDecodeError:
             raise CloudEdgeError("Failed to parse home device list response")
@@ -930,6 +1063,26 @@ class CloudEdgeClient:
                 # Convert to standardized format
                 standardized_devices = []
                 for device in devices:
+                    # Debug: log all status-related fields from the raw device data
+                    if self.debug:
+                        status_fields = {k: v for k, v in device.items() if 'status' in k.lower() or 'online' in k.lower() or k in ['onLine', 'devStatus']}
+                        self._log(f"Device '{device.get('deviceName')}' status fields: {status_fields}")
+                    
+                    # Determine online status from multiple possible fields
+                    online_status = False
+                    if 'onLine' in device:
+                        online_status = device.get('onLine') == 1
+                        if self.debug:
+                            self._log(f"  Using onLine={device.get('onLine')} -> {online_status}")
+                    elif 'devStatus' in device:
+                        online_status = device.get('devStatus') == 1
+                        if self.debug:
+                            self._log(f"  Using devStatus={device.get('devStatus')} -> {online_status}")
+                    elif 'online' in device:
+                        online_status = device.get('online') is True or device.get('online') == 1
+                        if self.debug:
+                            self._log(f"  Using online={device.get('online')} -> {online_status}")
+                    
                     device_dict = {
                         'device_id': device.get('deviceID'),
                         'serial_number': device.get('snNum'),
@@ -937,10 +1090,10 @@ class CloudEdgeClient:
                         'type': device.get('deviceTypeName', 'Unknown'),
                         'type_id': device.get('devTypeID'),
                         'host_key': device.get('hostKey'),
-                        'online': device.get('onLine') == 1  # Store original API status
+                        'online': online_status
                     }
                     
-                    # Get enhanced online status
+                    # Get enhanced online status (may override with ping result)
                     device_dict['online'] = self._get_enhanced_device_status(device_dict)
                     
                     standardized_devices.append(device_dict)
@@ -999,8 +1152,25 @@ class CloudEdgeClient:
             
             if response_data.get("resultCode") == "1001":
                 result = response_data.get("result", {})
+                
+                # Debug: log the raw result for status debugging
+                if self.debug:
+                    self._log(f"Device status API response result: {result}")
+                
+                # Check multiple possible status fields
+                online_status = False
+                if 'onLine' in result:
+                    online_status = result.get('onLine') == 1
+                elif 'devStatus' in result:
+                    online_status = result.get('devStatus') == 1
+                elif 'online' in result:
+                    online_status = result.get('online') is True or result.get('online') == 1
+                
+                if self.debug:
+                    self._log(f"Device status determined: {online_status}")
+                
                 return {
-                    'online': result.get('onLine') == 1,
+                    'online': online_status,
                     'last_seen': result.get('lastOnLineTime')
                 }
             else:
@@ -1079,7 +1249,8 @@ class CloudEdgeClient:
         headers = {
             "Accept": "*/*",
             "User-Agent": "Mozilla/5.0 (Linux; U; Android 10; en-us; Android SDK built for arm64 Build/QSR1.211112.002) AppleWebKit/533.1 (KHTML, like Gecko) Version/5.0 Mobile Safari/533.1",
-            "Accept-Language": "en-US,en;q=1"
+            "Accept-Language": "en-US,en;q=1",
+            "X-Ca-Key": CA_KEY
         }
         
         try:
@@ -1205,7 +1376,12 @@ class CloudEdgeClient:
             Optional[Dict]: Device information or None if not found
         """
         # First try the get_all_devices method for comprehensive search
-        devices = self.get_all_devices()
+        try:
+            devices = self.get_all_devices()
+        except AuthenticationError:
+            # If we're not authenticated, return None to indicate no device
+            # found (caller can decide to authenticate first)
+            return None
         
         # Search for exact match first
         for device in devices:
@@ -1279,10 +1455,32 @@ class CloudEdgeClient:
         if not device:
             raise DeviceNotFoundError(f"Device '{device_name}' not found")
             
-        # Get device status
-        status = self.get_device_status(device['device_id'])
-        if status:
-            device.update(status)
+        # Try to get updated device status, but don't overwrite if API returns empty
+        try:
+            status = self.get_device_status(device['device_id'])
+            if status:
+                # Only update if we got a valid status response
+                # Some regions/APIs return empty result - preserve existing status in that case
+                prev_online = device.get('online', False)
+                new_online = status.get('online', False)
+                
+                # Prefer the more positive status (if either shows online, use online)
+                # This handles cases where one API call succeeds and another fails
+                if new_online or prev_online:
+                    device['online'] = True
+                else:
+                    device['online'] = False
+                    
+                if status.get('last_seen'):
+                    device['last_seen'] = status['last_seen']
+                    
+                if self.debug:
+                    self._log(f"Updated device status: prev={prev_online}, new={new_online}, final={device['online']}")
+        except Exception as e:
+            if self.debug:
+                self._log(f"Failed to get updated device status (using existing): {e}")
+            # Keep existing status from device list API
+            pass
             
         # Get device configuration if requested
         if include_config:
