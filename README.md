@@ -50,10 +50,12 @@ pip install -e .[examples,dev]
 ### Dependencies
 
 The library requires:
+
 - **requests** (≥2.25.0) - For HTTP API communication
 - **cryptography** (≥3.4.0) - For credential encryption
 
 Optional dependencies:
+
 - **python-dotenv** (≥0.19.0) - For loading environment variables in examples
 
 ## Quick Start
@@ -238,7 +240,7 @@ cloudedge list --home-id YOUR_HOME_ID
 cloudedge info "Front Door Camera"
 ```
 
-#### Device Control
+#### CLI Device Control
 
 ```bash
 # Set device parameters
@@ -277,6 +279,7 @@ CloudEdgeClient(
 ```
 
 **Parameters:**
+
 - `username`: CloudEdge account email
 - `password`: CloudEdge account password
 - `country_code`: ISO country code (e.g., "US", "IT", "DE")
@@ -309,6 +312,7 @@ for device in devices:
 ```
 
 **Returns:** List of device dictionaries with keys:
+
 - `device_id`: Internal device ID
 - `serial_number`: Device serial number
 - `name`: Device name
@@ -551,6 +555,7 @@ client = CloudEdgeClient(..., debug=True)
 ```
 
 This will show:
+
 - Authentication process details
 - API request URLs and parameters
 - Response data
