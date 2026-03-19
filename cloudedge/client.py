@@ -35,7 +35,11 @@ from .iot_parameters import (
     get_parameter_code_by_name, 
     format_parameter_value
 )
-from .constants import CA_KEY, DEFAULT_HEADERS, DEFAULT_TIMEOUT
+from .constants import (
+    CA_KEY, DEFAULT_HEADERS, DEFAULT_TIMEOUT,
+    REGION_ENDPOINTS, REGION_EU, REGION_US,
+    region_for_country,
+)
 from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
 from .utils import retry_on_failure
@@ -64,9 +68,6 @@ class CloudEdgeClient:
         ...     print(f"Device: {device['name']} - Status: {device['online']}")
     """
     
-    BASE_URL = "https://apis-eu-frankfurt.cloudedge360.com"
-    OPENAPI_BASE_URL = "https://openapi-euce.mearicloud.com"
-    
     def __init__(
         self, 
         username: str, 
@@ -76,7 +77,8 @@ class CloudEdgeClient:
         debug: bool = False,
         session_cache_file: str = ".cloudedge_session_cache",
         enable_network_ping: bool = True,
-        ping_timeout: float = 2.0
+        ping_timeout: float = 2.0,
+        region: Optional[str] = None,
     ):
         """
         Initialize CloudEdge API client.
@@ -90,6 +92,9 @@ class CloudEdgeClient:
             session_cache_file (str): Path to session cache file
             enable_network_ping (bool): Enable ping-based online status when on same network
             ping_timeout (float): Ping timeout in seconds
+            region (str, optional): Force a specific region ("eu" or "us").
+                When *None* the region is derived automatically from *country_code*:
+                European countries use the EU endpoints, everything else uses US.
             
         Raises:
             ValidationError: If input validation fails
@@ -117,6 +122,13 @@ class CloudEdgeClient:
         self.password = password
         self.country_code = country_code.upper()
         self.phone_code = phone_code if phone_code.startswith('+') else f'+{phone_code}'
+        
+        # Resolve region and endpoints
+        resolved_region = region if region in REGION_ENDPOINTS else region_for_country(self.country_code)
+        endpoints = REGION_ENDPOINTS[resolved_region]
+        self.region = resolved_region
+        self.BASE_URL = endpoints["base_url"]
+        self.OPENAPI_BASE_URL = endpoints["openapi_base_url"]
         
         # Setup proper logging
         self.logger = get_logger("client")
