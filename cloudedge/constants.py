@@ -2,9 +2,44 @@
 Configuration constants for CloudEdge API
 """
 
-# API Endpoints
-BASE_URL = "https://apis-eu-frankfurt.cloudedge360.com"
-OPENAPI_BASE_URL = "https://openapi-euce.mearicloud.com"
+# Region identifiers
+REGION_EU = "eu"
+REGION_US = "us"
+
+# Per-region API endpoints
+REGION_ENDPOINTS = {
+    REGION_EU: {
+        "base_url": "https://apis-eu-frankfurt.cloudedge360.com",
+        "openapi_base_url": "https://openapi-euce.mearicloud.com",
+    },
+    REGION_US: {
+        "base_url": "https://apis-us-west.cloudedge360.com",
+        "openapi_base_url": "https://openapi-uswe.mearicloud.com",
+    },
+}
+
+# Default endpoints (EU) – kept for backward compatibility
+BASE_URL = REGION_ENDPOINTS[REGION_EU]["base_url"]
+OPENAPI_BASE_URL = REGION_ENDPOINTS[REGION_EU]["openapi_base_url"]
+
+# European country codes (ISO 3166-1 alpha-2)
+EU_COUNTRY_CODES = {
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+    "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL",
+    "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+    # EEA + EFTA + UK
+    "IS", "LI", "NO", "CH", "GB",
+    # Other European countries
+    "AL", "AD", "AM", "AZ", "BA", "BY", "GE", "GI", "XK", "MD",
+    "MC", "ME", "MK", "RS", "RU", "SM", "TR", "UA", "VA",
+}
+
+
+def region_for_country(country_code: str) -> str:
+    """Return the region key for a given ISO 3166-1 alpha-2 country code."""
+    if country_code.upper() in EU_COUNTRY_CODES:
+        return REGION_EU
+    return REGION_US
 
 # API Keys (these are public keys from the mobile app)
 CA_KEY = "bc29be30292a4309877807e101afbd51"
