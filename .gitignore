@@ -119,3 +119,5 @@ cloudedge/_version.py
 # CloudEdge specific
 .cloudedge_session_cache
 .home_id
+
+publish.sh

@@ -44,6 +44,54 @@ from .validators import validate_email, validate_country_code, validate_phone_co
 from .logging_config import get_logger
 from .utils import retry_on_failure
 
+# API list keys → readable product type when deviceTypeName is a CDN image URL
+_DEVICE_LIST_CATEGORY_LABELS = {
+    "snap": "Camera",
+    "ipc": "Camera",
+    "nvr": "NVR",
+    "doorbell": "Doorbell",
+    "chime": "Chime",
+}
+
+
+def _device_icon_url_from_type_name(device_type_name: Any) -> Optional[str]:
+    """Return URL if deviceTypeName is an http(s) icon URL (Meari/OSS), else None."""
+    if not isinstance(device_type_name, str):
+        return None
+    s = device_type_name.strip()
+    if s.startswith(("http://", "https://")):
+        return s
+    return None
+
+
+def _human_type_and_icon_url(
+    device: Dict[str, Any],
+    list_category: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """
+    CloudEdge often puts a product image URL in deviceTypeName instead of a label.
+    Return a human-readable type for UIs (e.g. Home Assistant model) and optional icon URL.
+    """
+    raw = device.get("deviceTypeName")
+    icon_url = _device_icon_url_from_type_name(raw)
+    if icon_url is not None:
+        label = _DEVICE_LIST_CATEGORY_LABELS.get(list_category or "", "SmartEye Camera")
+        lower = icon_url.lower()
+        if "doorbell" in lower:
+            label = "Doorbell"
+        elif "chime" in lower:
+            label = "Chime"
+        elif "nvr" in lower:
+            label = "NVR"
+        elif "snap" in lower or "ipc" in lower:
+            label = "Camera"
+        return label, icon_url
+    if raw is not None and str(raw).strip():
+        return str(raw).strip(), None
+    if list_category:
+        return _DEVICE_LIST_CATEGORY_LABELS.get(list_category, "Unknown"), None
+    return "Unknown", None
+
 
 class CloudEdgeClient:
     """
@@ -787,15 +835,19 @@ class CloudEdgeClient:
                         device_list = response_data[device_type]
                         if isinstance(device_list, list):
                             for device in device_list:
+                                type_str, icon_url = _human_type_and_icon_url(
+                                    device, list_category=device_type
+                                )
                                 device_dict = {
                                     'device_id': device.get('deviceID'),
                                     'serial_number': device.get('snNum'),
                                     'name': device.get('deviceName', 'Unnamed'),
-                                    'type': device.get('deviceTypeName', 'Unknown'),
+                                    'type': type_str,
                                     'type_id': device.get('devTypeID'),
                                     'host_key': device.get('hostKey'),
                                     'online': device.get('devStatus') == 1,  # Store original API status
-                                    'home_id': home_id
+                                    'home_id': home_id,
+                                    'device_icon_url': icon_url,
                                 }
                                 
                                 # Get enhanced online status
@@ -920,43 +972,54 @@ class CloudEdgeClient:
                     import json
                     self._log(f"API Response structure: {json.dumps(response_data, indent=2)}")
                 
-                devices = []
-                
-                # Check for devices in different device type keys (working format)
                 device_types = ['nvr', 'ipc', 'chime', 'doorbell', 'snap']
-                
-                for device_type in device_types:
-                    if device_type in response_data and response_data[device_type]:
-                        device_list = response_data[device_type]
-                        if isinstance(device_list, list):
-                            self._log(f"Found {len(device_list)} devices under '{device_type}' key")
-                            devices.extend(device_list)
-                
-                # Fallback: check for devices in result.deviceList (older format)
-                if not devices:
-                    device_list = response_data.get("result", {}).get("deviceList", [])
-                    if isinstance(device_list, list) and device_list:
-                        self._log(f"Found {len(device_list)} devices under 'result.deviceList' key")
-                        devices.extend(device_list)
-                
-                # Convert to standardized format
                 standardized_devices = []
-                for device in devices:
-                    device_dict = {
-                        'device_id': device.get('deviceID'),
-                        'serial_number': device.get('snNum'),
-                        'name': device.get('deviceName', 'Unnamed'),
-                        'type': device.get('deviceTypeName', 'Unknown'),
-                        'type_id': device.get('devTypeID'),
-                        'host_key': device.get('hostKey'),
-                        'online': device.get('onLine') == 1  # Store original API status
-                    }
-                    
-                    # Get enhanced online status
-                    device_dict['online'] = self._get_enhanced_device_status(device_dict)
-                    
-                    standardized_devices.append(device_dict)
-                    
+
+                # Modern API: devices grouped by category key
+                for device_type in device_types:
+                    device_list = response_data.get(device_type)
+                    if not isinstance(device_list, list) or not device_list:
+                        continue
+                    self._log(f"Found {len(device_list)} devices under '{device_type}' key")
+                    for device in device_list:
+                        type_str, icon_url = _human_type_and_icon_url(
+                            device, list_category=device_type
+                        )
+                        device_dict = {
+                            'device_id': device.get('deviceID'),
+                            'serial_number': device.get('snNum'),
+                            'name': device.get('deviceName', 'Unnamed'),
+                            'type': type_str,
+                            'type_id': device.get('devTypeID'),
+                            'host_key': device.get('hostKey'),
+                            'online': device.get('onLine') == 1,
+                            'device_icon_url': icon_url,
+                        }
+                        device_dict['online'] = self._get_enhanced_device_status(device_dict)
+                        standardized_devices.append(device_dict)
+
+                # Older API fallback: devices under result.deviceList
+                if not standardized_devices:
+                    fallback_list = response_data.get("result", {}).get("deviceList", [])
+                    if isinstance(fallback_list, list) and fallback_list:
+                        self._log(f"Found {len(fallback_list)} devices under 'result.deviceList' key")
+                        for device in fallback_list:
+                            type_str, icon_url = _human_type_and_icon_url(
+                                device, list_category=None
+                            )
+                            device_dict = {
+                                'device_id': device.get('deviceID'),
+                                'serial_number': device.get('snNum'),
+                                'name': device.get('deviceName', 'Unnamed'),
+                                'type': type_str,
+                                'type_id': device.get('devTypeID'),
+                                'host_key': device.get('hostKey'),
+                                'online': device.get('onLine') == 1,
+                                'device_icon_url': icon_url,
+                            }
+                            device_dict['online'] = self._get_enhanced_device_status(device_dict)
+                            standardized_devices.append(device_dict)
+
                 return standardized_devices
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
