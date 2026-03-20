@@ -44,6 +44,11 @@ from .validators import validate_email, validate_country_code, validate_phone_co
 from .logging_config import get_logger
 from .utils import retry_on_failure
 
+# Device online status values returned by get_device_online_status()
+DEVICE_STATUS_ONLINE = "online"
+DEVICE_STATUS_DORMANCY = "dormancy"
+DEVICE_STATUS_OFFLINE = "offline"
+
 # API list keys → readable product type when deviceTypeName is a CDN image URL
 _DEVICE_LIST_CATEGORY_LABELS = {
     "snap": "Camera",
@@ -1091,7 +1096,279 @@ class CloudEdgeClient:
             raise NetworkError(f"Device status request failed: {e}")
         except json.JSONDecodeError:
             raise CloudEdgeError("Failed to parse device status response")
-            
+
+    def get_device_online_status(self, serial_number: str) -> str:
+        """Query the precise online state of a device via OpenAPI.
+
+        Unlike :meth:`get_device_status` (which uses a legacy endpoint and
+        only distinguishes online/offline), this method calls
+        ``/openapi/device/status`` and can distinguish three states:
+
+        * ``"online"``   – camera is awake and reachable
+        * ``"dormancy"`` – battery camera is asleep (must be woken before commands)
+        * ``"offline"``  – camera is unreachable
+
+        Use the module-level constants :data:`DEVICE_STATUS_ONLINE`,
+        :data:`DEVICE_STATUS_DORMANCY`, :data:`DEVICE_STATUS_OFFLINE` for
+        comparisons.
+
+        Args:
+            serial_number (str): Device serial number (snNum).
+
+        Returns:
+            str: ``"online"``, ``"dormancy"``, ``"offline"``, or ``"unknown"``.
+
+        Raises:
+            AuthenticationError: If not authenticated.
+            NetworkError: If the HTTP request fails.
+        """
+        if not self.session_data:
+            raise AuthenticationError("Not authenticated - call authenticate() first")
+
+        iot_keys = self.session_data.get('iotPlatformKeys', {})
+        if not iot_keys or 'accessid' not in iot_keys or 'accesskey' not in iot_keys:
+            self._log("No OpenAPI credentials — cannot query dormancy status")
+            return "unknown"
+
+        access_id = iot_keys['accessid']
+        access_key = iot_keys['accesskey']
+        formatted_sn = self._format_sn(serial_number)
+
+        signature, timeout = self._get_signature_for_openapi(
+            '/openapi/device/status', 'query', access_key
+        )
+        params = {
+            'accessid': access_id,
+            'expires': timeout,
+            'signature': signature,
+            'action': 'query',
+            'deviceid': formatted_sn,
+        }
+        headers = {
+            "Accept": "*/*",
+            "User-Agent": DEFAULT_HEADERS['User-Agent'],
+        }
+
+        try:
+            response = self._make_request(
+                'GET',
+                f"{self.OPENAPI_BASE_URL}/openapi/device/status",
+                headers=headers,
+                params=params,
+                timeout=DEFAULT_TIMEOUT,
+            )
+            data = response.json()
+            status = data.get('status', 'unknown')
+            self._log(f"Device {serial_number} online status: {status}")
+            return status
+        except requests.exceptions.RequestException as e:
+            raise NetworkError(f"Device status request failed: {e}")
+        except json.JSONDecodeError:
+            raise CloudEdgeError("Failed to parse device status response")
+
+    def wake_device(
+        self,
+        serial_number: str,
+        device_id: Optional[Union[int, str]] = None,
+    ) -> bool:
+        """Send a wake signal to a dormant battery camera.
+
+        Uses two independent mechanisms for reliability:
+
+        1. **OpenAPI** ``/openapi/device/awaken`` — cloud-to-camera push via
+           the IoT platform (requires OpenAPI credentials).
+        2. **REST** ``/v1/app/bell/remote/wake`` — legacy bell/doorbell wake
+           signal (requires *device_id*).
+
+        Both methods are attempted; success is reported if at least one
+        succeeds.  Call :meth:`wait_for_online` or :meth:`ensure_online`
+        afterwards to confirm the camera has woken.
+
+        Args:
+            serial_number (str): Device serial number (snNum).
+            device_id (int | str | None): Numeric device ID (deviceID).
+                Optional but recommended — without it only method 1 is used.
+
+        Returns:
+            bool: ``True`` if at least one wake method succeeded.
+
+        Raises:
+            AuthenticationError: If not authenticated.
+        """
+        if not self.session_data:
+            raise AuthenticationError("Not authenticated - call authenticate() first")
+
+        success = False
+
+        # Method 1 — OpenAPI /openapi/device/awaken
+        iot_keys = self.session_data.get('iotPlatformKeys', {})
+        if iot_keys and 'accessid' in iot_keys and 'accesskey' in iot_keys:
+            try:
+                access_id = iot_keys['accessid']
+                access_key = iot_keys['accesskey']
+                formatted_sn = self._format_sn(serial_number)
+                sid = (formatted_sn + str(int(time.time() * 1000)))[:30]
+
+                signature, timeout = self._get_signature_for_openapi(
+                    '/openapi/device/awaken', 'set', access_key
+                )
+                params = {
+                    'accessid': access_id,
+                    'expires': timeout,
+                    'signature': signature,
+                    'action': 'set',
+                    'deviceid': formatted_sn,
+                    'sid': sid,
+                }
+                headers = {
+                    "Accept": "*/*",
+                    "User-Agent": DEFAULT_HEADERS['User-Agent'],
+                }
+                response = self._make_request(
+                    'GET',
+                    f"{self.OPENAPI_BASE_URL}/openapi/device/awaken",
+                    headers=headers,
+                    params=params,
+                    timeout=DEFAULT_TIMEOUT,
+                )
+                if response.status_code == 200:
+                    self._log(f"OpenAPI wake sent for {serial_number}")
+                    success = True
+            except Exception as e:
+                self._log(f"OpenAPI wake failed: {e}")
+
+        # Method 2 — /v1/app/bell/remote/wake (requires device_id)
+        if device_id is not None:
+            try:
+                device_body = self._generate_device_body({'deviceID': str(device_id)})
+                headers = {
+                    "Accept": "*/*",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": DEFAULT_HEADERS['User-Agent'],
+                }
+                response = self._make_request(
+                    'POST',
+                    f"{self.BASE_URL}/v1/app/bell/remote/wake",
+                    headers=headers,
+                    data=device_body,
+                    timeout=DEFAULT_TIMEOUT,
+                )
+                if response.json().get('resultCode') in ('1001', '0'):
+                    self._log(f"Bell wake sent for device_id={device_id}")
+                    success = True
+            except Exception as e:
+                self._log(f"Bell wake failed: {e}")
+
+        if not success:
+            self._log(
+                f"All wake methods failed for {serial_number} — device may be offline"
+            )
+        return success
+
+    def wait_for_online(
+        self,
+        serial_number: str,
+        timeout: float = 30.0,
+        poll_interval: float = 2.0,
+    ) -> bool:
+        """Poll until the device reports ``"online"`` status or the timeout expires.
+
+        Typically called right after :meth:`wake_device` to confirm the camera
+        has woken up before issuing commands.
+
+        Args:
+            serial_number (str): Device serial number.
+            timeout (float): Maximum seconds to wait (default 30).
+            poll_interval (float): Seconds between status checks (default 2).
+
+        Returns:
+            bool: ``True`` if the camera came online within *timeout* seconds.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                status = self.get_device_online_status(serial_number)
+                if status == DEVICE_STATUS_ONLINE:
+                    self._log(f"Device {serial_number} is now online")
+                    return True
+                self._log(
+                    f"Device {serial_number} status={status}, "
+                    f"waiting ({deadline - time.time():.0f}s left)..."
+                )
+            except Exception as e:
+                self._log(f"Status check error: {e}")
+
+            remaining = deadline - time.time()
+            if remaining > 0:
+                time.sleep(min(poll_interval, remaining))
+
+        self._log(f"Timeout waiting for {serial_number} to come online")
+        return False
+
+    def ensure_online(
+        self,
+        serial_number: str,
+        device_id: Optional[Union[int, str]] = None,
+        timeout: float = 35.0,
+        auto_wake: bool = True,
+    ) -> bool:
+        """Ensure a camera is online, waking it first if dormant.
+
+        This is the recommended guard to call before any command that requires
+        the camera to be awake (e.g. :meth:`set_device_config`,
+        :meth:`get_device_config` on live parameters).
+
+        Behaviour:
+
+        * **online** → returns ``True`` immediately.
+        * **dormancy** → sends a wake signal (if *auto_wake* is ``True``),
+          then polls until online or *timeout* expires.
+        * **offline** → returns ``False`` immediately (offline cameras cannot
+          be woken over the cloud).
+        * **unknown** → returns ``False`` (credentials or network issue).
+
+        Args:
+            serial_number (str): Device serial number.
+            device_id (int | str | None): Numeric device ID, passed to
+                :meth:`wake_device` for the secondary wake method.
+            timeout (float): Max seconds to wait after waking (default 35).
+            auto_wake (bool): Send wake signal when dormant (default ``True``).
+
+        Returns:
+            bool: ``True`` if the camera is (or becomes) online.
+
+        Example::
+
+            if client.ensure_online(sn, device_id):
+                client.set_device_config(sn, {"1": 1})
+            else:
+                print("Camera unreachable — skipping command")
+        """
+        status = self.get_device_online_status(serial_number)
+
+        if status == DEVICE_STATUS_ONLINE:
+            return True
+
+        if status == DEVICE_STATUS_OFFLINE:
+            self._log(f"Device {serial_number} is offline — cannot wake")
+            return False
+
+        if status == DEVICE_STATUS_DORMANCY:
+            if not auto_wake:
+                self._log(
+                    f"Device {serial_number} is dormant but auto_wake=False"
+                )
+                return False
+            self._log(f"Device {serial_number} is dormant — sending wake signal")
+            self.wake_device(serial_number, device_id)
+            return self.wait_for_online(serial_number, timeout=timeout)
+
+        # Unknown status
+        self._log(
+            f"Device {serial_number} status={status!r} — cannot determine reachability"
+        )
+        return False
+
     def get_device_config(self, device_serial: str, 
                           parameter_codes: Optional[List[str]] = None) -> Optional[Dict]:
         """
@@ -1178,24 +1455,58 @@ class CloudEdgeClient:
         except json.JSONDecodeError as e:
             raise ConfigurationError(f"Failed to parse config response: {e}")
             
-    def set_device_config(self, device_serial: str, parameters: Dict[str, Any]) -> bool:
-        """
-        Set device configuration parameters.
-        
+    def set_device_config(
+        self,
+        device_serial: str,
+        parameters: Dict[str, Any],
+        auto_wake: bool = True,
+        device_id: Optional[Union[int, str]] = None,
+    ) -> bool:
+        """Set device configuration parameters.
+
+        For battery cameras that may be in ``dormancy`` state, pass
+        ``auto_wake=True`` (default) together with *device_id* so the method
+        will automatically wake the camera and wait for it to come online
+        before sending the command.
+
         Args:
-            device_serial (str): Device serial number
-            parameters (Dict[str, Any]): Parameter codes and values to set
-            
+            device_serial (str): Device serial number.
+            parameters (Dict[str, Any]): Parameter codes and values to set,
+                e.g. ``{"1": 1}`` or ``{"PIR_SWITCH": 1}``.
+            auto_wake (bool): Wake a dormant camera automatically before
+                issuing the command (default ``True``).
+            device_id (int | str | None): Numeric device ID used by the
+                secondary wake method.  Ignored when *auto_wake* is ``False``.
+
         Returns:
-            bool: True if successful, False otherwise
-            
+            bool: ``True`` if successful.
+
         Raises:
-            AuthenticationError: If not authenticated
-            ConfigurationError: If configuration setting fails
+            AuthenticationError: If not authenticated.
+            ConfigurationError: If configuration setting fails.
         """
         if not self.session_data:
             raise AuthenticationError("Not authenticated - call authenticate() first")
-            
+
+        # Wake dormant battery cameras before sending the command
+        if auto_wake:
+            status = self.get_device_online_status(device_serial)
+            if status == DEVICE_STATUS_DORMANCY:
+                self._log(
+                    f"set_device_config: device {device_serial} is dormant — waking first"
+                )
+                self.wake_device(device_serial, device_id)
+                if not self.wait_for_online(device_serial):
+                    raise ConfigurationError(
+                        "Device did not come online after wake signal",
+                        details={"device_serial": device_serial},
+                    )
+            elif status == DEVICE_STATUS_OFFLINE:
+                raise ConfigurationError(
+                    "Device is offline — cannot send configuration",
+                    details={"device_serial": device_serial},
+                )
+
         self._log(f"Setting device configuration for SN: {device_serial}")
         
         # Check if we have OpenAPI credentials
@@ -1294,45 +1605,54 @@ class CloudEdgeClient:
                 
         return None
         
-    def set_device_parameter(self, device_name: str, parameter_name: str, 
-                             value: Union[int, str, float]) -> bool:
-        """
-        Set a single device parameter by name.
-        
+    def set_device_parameter(
+        self,
+        device_name: str,
+        parameter_name: str,
+        value: Union[int, str, float],
+        auto_wake: bool = True,
+    ) -> bool:
+        """Set a single device parameter by name.
+
         Args:
-            device_name (str): Device name
-            parameter_name (str): Parameter name (e.g., "FRONT_LIGHT_SWITCH")
-            value (Union[int, str, float]): Parameter value
-            
+            device_name (str): Device name.
+            parameter_name (str): Parameter name, e.g. ``"FRONT_LIGHT_SWITCH"``.
+            value (int | str | float): Parameter value.
+            auto_wake (bool): Wake a dormant camera before sending the command
+                (default ``True``).  The device's numeric ID is resolved
+                automatically from the device list.
+
         Returns:
-            bool: True if successful, False otherwise
-            
+            bool: ``True`` if successful.
+
         Raises:
-            DeviceNotFoundError: If device not found
-            ConfigurationError: If parameter is invalid or setting fails
+            DeviceNotFoundError: If device not found.
+            ConfigurationError: If parameter is invalid or setting fails.
         """
-        # Find device
         device = self.find_device_by_name(device_name)
         if not device:
             raise DeviceNotFoundError(f"Device '{device_name}' not found")
-            
-        # Get parameter code
+
         parameter_code = get_parameter_code_by_name(parameter_name)
         if not parameter_code:
             raise ConfigurationError(
                 f"Unknown parameter: {parameter_name}",
-                details={"parameter_name": parameter_name, "device": device_name}
+                details={"parameter_name": parameter_name, "device": device_name},
             )
-            
-        # Set parameter
+
         parameters = {parameter_code: value}
-        success = self.set_device_config(device['serial_number'], parameters)
-        
+        success = self.set_device_config(
+            device['serial_number'],
+            parameters,
+            auto_wake=auto_wake,
+            device_id=device.get('device_id'),
+        )
+
         if success:
             param_display = get_parameter_name(parameter_code)
             formatted_value = format_parameter_value(param_display, value)
             self._log(f"Set {param_display} = {formatted_value} on device '{device_name}'")
-            
+
         return success
         
     def get_device_info(self, device_name: str, include_config: bool = True) -> Optional[Dict]:

@@ -9,7 +9,12 @@ Author: Francesco D'Aloisio
 Date: September 16, 2025
 """
 
-from .client import CloudEdgeClient
+from .client import (
+    CloudEdgeClient,
+    DEVICE_STATUS_ONLINE,
+    DEVICE_STATUS_DORMANCY,
+    DEVICE_STATUS_OFFLINE,
+)
 from .exceptions import (
     CloudEdgeError, AuthenticationError, DeviceNotFoundError, 
     ConfigurationError, NetworkError, ValidationError, RateLimitError
@@ -24,6 +29,9 @@ __author__ = "Francesco D'Aloisio"
 
 __all__ = [
     'CloudEdgeClient',
+    'DEVICE_STATUS_ONLINE',
+    'DEVICE_STATUS_DORMANCY',
+    'DEVICE_STATUS_OFFLINE',
     'CloudEdgeError', 
     'AuthenticationError',
     'DeviceNotFoundError',
