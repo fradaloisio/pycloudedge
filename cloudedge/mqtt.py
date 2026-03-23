@@ -59,6 +59,13 @@ MOTION_ALARM_TYPES: frozenset[int] = frozenset({1, 2, 11, 20})
 OnEventCallback = Callable[[str, str, int, bool], None]
 """Signature: (device_id, event_name, event_type_int, is_motion) -> None"""
 
+OnEventCallbackEx = Callable[[str, str, int, bool, dict], None]
+"""Extended signature: (device_id, event_name, event_type_int, is_motion, extra) -> None
+
+``extra`` contains optional fields from the payload such as
+``url``, ``alert``, ``deviceName``, ``licenseID``, ``msgDate``.
+"""
+
 
 class CloudEdgeMqttListener:
     """Subscribe to the CloudEdge/Meari MQTT broker for push events.
@@ -205,15 +212,37 @@ class CloudEdgeMqttListener:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
 
-        # Unwrap nested envelope: params → data → msg
-        for key in ("params", "data"):
+        _LOGGER.info("MQTT raw payload: %s", json.dumps(data, default=str)[:2000])
+
+        original = data
+
+        # Unwrap nested envelope — walk into nested dicts looking for the event
+        # Real payload: { "event": "alarm", "params": { "result": { "evt": "1", "deviceID": "...", ... } } }
+        for key in ("params", "result", "data", "state", "reported"):
             if key in data and isinstance(data[key], dict):
                 data = data[key]
         if "msg" in data and isinstance(data["msg"], dict):
             data = data["msg"]
 
-        evt_raw = data.get("evt", data.get("eventType", ""))
-        device_id = str(data.get("deviceID", data.get("deviceId", "")))
+        for key in ("alarm", "alarmInfo"):
+            if key in data and isinstance(data[key], dict):
+                data = data[key]
+
+        evt_raw = (
+            data.get("evt")
+            or data.get("eventType")
+            or data.get("alarmType")
+            or data.get("type")
+            or ""
+        )
+        device_id = str(
+            data.get("deviceID")
+            or data.get("deviceId")
+            or data.get("devID")
+            or data.get("did")
+            or original.get("state", {}).get("reported", {}).get("deviceID", "")
+            or ""
+        )
 
         try:
             evt_int = int(evt_raw)
@@ -223,19 +252,35 @@ class CloudEdgeMqttListener:
         evt_name = ALARM_TYPE_NAMES.get(evt_int, f"type={evt_raw}")
         is_motion = evt_int in MOTION_ALARM_TYPES
 
+        extra: dict = {}
+        for field in ("url", "alert", "deviceName", "licenseID", "msgDate", "title"):
+            val = data.get(field)
+            if val:
+                extra[field] = str(val)
+
         _LOGGER.info(
-            "MQTT event: %s  device=%s  motion=%s",
-            evt_name, device_id, is_motion,
+            "MQTT event: %s  device=%s  motion=%s  url=%s",
+            evt_name, device_id, is_motion, bool(extra.get("url")),
         )
 
         if self.on_event:
             try:
-                self.on_event(device_id, evt_name, evt_int, is_motion)
+                self.on_event(device_id, evt_name, evt_int, is_motion, extra)
+            except TypeError:
+                try:
+                    self.on_event(device_id, evt_name, evt_int, is_motion)
+                except Exception as exc:
+                    _LOGGER.debug("on_event callback error: %s", exc)
             except Exception as exc:
                 _LOGGER.debug("on_event callback error: %s", exc)
 
         if is_motion and self.on_motion:
             try:
-                self.on_motion(device_id, evt_name, evt_int, is_motion)
+                self.on_motion(device_id, evt_name, evt_int, is_motion, extra)
+            except TypeError:
+                try:
+                    self.on_motion(device_id, evt_name, evt_int, is_motion)
+                except Exception as exc:
+                    _LOGGER.debug("on_motion callback error: %s", exc)
             except Exception as exc:
                 _LOGGER.debug("on_motion callback error: %s", exc)

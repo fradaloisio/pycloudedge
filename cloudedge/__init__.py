@@ -16,6 +16,7 @@ from .client import (
     DEVICE_STATUS_OFFLINE,
 )
 from .mqtt import CloudEdgeMqttListener, ALARM_TYPE_NAMES, MOTION_ALARM_TYPES
+from .image_decrypt import decrypt_jpgx3, decrypt_jpgx3_from_url, verify_licence_for_url
 from .exceptions import (
     CloudEdgeError, AuthenticationError, DeviceNotFoundError, 
     ConfigurationError, NetworkError, ValidationError, RateLimitError
@@ -45,5 +46,8 @@ __all__ = [
     'RateLimitError',
     'IOT_PARAMETERS',
     'get_parameter_name',
-    'format_parameter_value'
+    'format_parameter_value',
+    'decrypt_jpgx3',
+    'decrypt_jpgx3_from_url',
+    'verify_licence_for_url',
 ]
