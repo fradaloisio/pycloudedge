@@ -562,6 +562,13 @@ class CloudEdgeClient:
         self.session_data = self._load_session_cache()
         if self.session_data:
             self._log("Using cached session")
+            # Fetch MQTT config if not already present in the cached session
+            if not self.session_data.get("mqtt"):
+                try:
+                    self._fetch_iot_config()
+                    self._save_session_cache(self.session_data)
+                except Exception as exc:
+                    self._log(f"IoT config fetch failed (non-fatal): {exc}")
             return True
             
         self._log("Performing CloudEdge login...")
