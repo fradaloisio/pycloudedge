@@ -653,9 +653,15 @@ class CloudEdgeClient:
                     "caKey": ca_key,
                     "loginTime": int(time.time()),
                     "apiServer": self.BASE_URL,
-                    "iotPlatformKeys": iot_platform_keys
+                    "iotPlatformKeys": iot_platform_keys,
                 }
-                
+
+                # Fetch MQTT / IoT platform config (host, port, mqtt signature)
+                try:
+                    self._fetch_iot_config()
+                except Exception as exc:
+                    self._log(f"IoT config fetch failed (non-fatal): {exc}")
+
                 self._save_session_cache(self.session_data)
                 return True
             else:
@@ -671,6 +677,155 @@ class CloudEdgeClient:
         except json.JSONDecodeError:
             raise AuthenticationError("Failed to parse login response")
             
+    @staticmethod
+    def _aes_cbc_decrypt(ciphertext_b64: str, key_str: str) -> str:
+        """AES-CBC decrypt (key == IV, PKCS7 padding).
+
+        Uses PyCryptodome when available (more lenient on padding edge cases
+        found in Meari responses), falls back to ``cryptography``.
+        """
+        key = key_str.encode("utf-8")
+        pad_len = 4 - len(ciphertext_b64) % 4 if len(ciphertext_b64) % 4 else 0
+        ct = base64.b64decode(ciphertext_b64 + "=" * pad_len)
+
+        try:
+            from Crypto.Cipher import AES
+            from Crypto.Util.Padding import unpad
+            cipher = AES.new(key, AES.MODE_CBC, key)
+            return unpad(cipher.decrypt(ct), AES.block_size).decode("utf-8")
+        except ImportError:
+            from cryptography.hazmat.primitives.ciphers import (
+                Cipher, algorithms, modes,
+            )
+            from cryptography.hazmat.primitives import padding
+            cipher = Cipher(algorithms.AES(key), modes.CBC(key))
+            decryptor = cipher.decryptor()
+            padded = decryptor.update(ct) + decryptor.finalize()
+            unpadder = padding.PKCS7(128).unpadder()
+            return (unpadder.update(padded) + unpadder.finalize()).decode("utf-8")
+
+    def _fetch_iot_config(self) -> None:
+        """Fetch MQTT and OpenAPI config from ``/v2/app/config/pf/init``.
+
+        Decrypts the platform signature to obtain the real ``access_id`` and
+        ``access_key`` required by the MQTT broker.  Stores results in
+        ``self.session_data["mqtt"]``.
+
+        Called automatically after a successful :meth:`authenticate`.
+        """
+        if not self.session_data:
+            return
+
+        user_token = self.session_data["userToken"]
+        user_id = self.session_data["userID"]
+        ts = int(time.time() * 1000)
+
+        params = {
+            'appVer': '5.5.1', 'appVerCode': '551', 'lngType': 'en',
+            'phoneType': 'a', 'sdkVer': '1.0.0', 'sourceApp': '8',
+            'countryCode': self.country_code,
+            'phoneCode': self.phone_code,
+            'iotType': '4',
+            'signatureMethod': 'HMAC-SHA1', 'signatureVersion': '1.0',
+            'signatureNonce': str(ts),
+            't': str(ts), 'timestamp': str(ts),
+            'userID': str(user_id),
+        }
+        sorted_keys = sorted(params.keys())
+        content = "&".join(f"{k}={params[k]}" for k in sorted_keys)
+        params['signature'] = base64.b64encode(
+            hmac.new(user_token.encode(), content.encode(), hashlib.sha1).digest()
+        ).decode()
+
+        xca_headers = self._generate_xca_headers(
+            f"api=/ppstrongs/v2/app/config/pf/init"
+            f"|X-Ca-Key={user_token}"
+            f"|X-Ca-Timestamp={str(ts)}"
+            f"|X-Ca-Nonce={str(ts % 100000000)}",
+            user_token,
+        )
+
+        try:
+            resp = self._session.get(
+                f"{self.BASE_URL}/v2/app/config/pf/init",
+                params=params,
+                headers={**DEFAULT_HEADERS, **xca_headers},
+                timeout=DEFAULT_TIMEOUT,
+            )
+            data = resp.json()
+            if data.get("resultCode") != "1001":
+                self._log(f"IoT config response: {data.get('resultCode')}")
+                return
+
+            pf = data.get("result", {}).get("pfApi", {})
+
+            # ── Decrypt platform signature to get real access_id/key ─────
+            #
+            # The MQTT broker authenticates with the *decrypted* access_id
+            # (not the raw "mearicloud" value from the login response).
+            # Key derivation: base64(userID + PARTNER_ID + TTID + expireTime)[:16]
+            PARTNER_ID = "8"
+            TTID = "a"
+
+            access_id = ""
+            access_key = ""
+            platform = pf.get("platform", {})
+            plat_sig = platform.get("signature", "")
+            expire_time = str(platform.get("expireTime", ""))
+
+            if plat_sig and expire_time:
+                try:
+                    key_raw = f"{user_id}{PARTNER_ID}{TTID}{expire_time}"
+                    key16 = base64.b64encode(key_raw.encode()).decode().rstrip("=")[:16]
+                    decrypted = self._aes_cbc_decrypt(plat_sig, key16)
+                    info_b64 = decrypted.split("-")[0]
+                    pad = 4 - len(info_b64) % 4 if len(info_b64) % 4 else 0
+                    info_json = base64.b64decode(info_b64 + "=" * pad).decode()
+                    info = json.loads(info_json)
+                    access_id = info.get("accessid", "")
+                    access_key = info.get("accesskey", "")
+                    self._log(f"Decrypted MQTT access_id: {access_id[:12]}...")
+                except Exception as exc:
+                    self._log(f"Platform signature decryption failed: {exc}")
+
+            mqtt_cfg = pf.get("mqtt", {})
+            self.session_data["mqtt"] = {
+                "mqtt_host": mqtt_cfg.get("host", ""),
+                "mqtt_port": int(mqtt_cfg.get("port", 1883)),
+                "mqtt_signature": pf.get("mqttSignature", ""),
+                "mqtt_access_id": access_id,
+                "mqtt_access_key": access_key,
+            }
+            self._log(
+                f"MQTT config: {self.session_data['mqtt']['mqtt_host']}"
+                f":{self.session_data['mqtt']['mqtt_port']}"
+            )
+        except Exception as exc:
+            self._log(f"Failed to fetch IoT config: {exc}")
+
+    def get_mqtt_config(self) -> Optional[Dict[str, Any]]:
+        """Return MQTT connection parameters, or ``None`` if unavailable.
+
+        The returned dict contains:
+
+        * ``mqtt_host`` (str)
+        * ``mqtt_port`` (int)
+        * ``mqtt_signature`` (str) — password for the MQTT broker
+        * ``mqtt_access_id`` (str) — username for the MQTT broker
+        * ``user_id`` (int | str) — used in the topic path
+
+        Call :meth:`authenticate` first.
+        """
+        if not self.session_data:
+            return None
+        mqtt = self.session_data.get("mqtt")
+        if not mqtt or not mqtt.get("mqtt_host"):
+            return None
+        return {
+            **mqtt,
+            "user_id": self.session_data.get("userID"),
+        }
+
     def _generate_device_body(self, extra_params: Optional[Dict] = None) -> Dict:
         """Generate device body for API requests."""
         if not self.session_data:

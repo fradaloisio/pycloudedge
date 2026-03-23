@@ -15,6 +15,7 @@ from .client import (
     DEVICE_STATUS_DORMANCY,
     DEVICE_STATUS_OFFLINE,
 )
+from .mqtt import CloudEdgeMqttListener, ALARM_TYPE_NAMES, MOTION_ALARM_TYPES
 from .exceptions import (
     CloudEdgeError, AuthenticationError, DeviceNotFoundError, 
     ConfigurationError, NetworkError, ValidationError, RateLimitError
@@ -32,6 +33,9 @@ __all__ = [
     'DEVICE_STATUS_ONLINE',
     'DEVICE_STATUS_DORMANCY',
     'DEVICE_STATUS_OFFLINE',
+    'CloudEdgeMqttListener',
+    'ALARM_TYPE_NAMES',
+    'MOTION_ALARM_TYPES',
     'CloudEdgeError', 
     'AuthenticationError',
     'DeviceNotFoundError',
