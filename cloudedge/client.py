@@ -36,8 +36,9 @@ from .iot_parameters import (
     format_parameter_value
 )
 from .constants import (
-    CA_KEY, DEFAULT_HEADERS, DEFAULT_TIMEOUT,
-    REGION_ENDPOINTS, REGION_EU, REGION_US,
+    CA_KEY, CA_SECRET, DEFAULT_HEADERS, DEFAULT_TIMEOUT,
+    REGION_ENDPOINTS, REGION_EU, REGION_US, REGION_AP,
+    REDIRECT_URL,
     region_for_country,
 )
 from .validators import validate_email, validate_country_code, validate_phone_code
@@ -145,9 +146,10 @@ class CloudEdgeClient:
             session_cache_file (str): Path to session cache file
             enable_network_ping (bool): Enable ping-based online status when on same network
             ping_timeout (float): Ping timeout in seconds
-            region (str, optional): Force a specific region ("eu" or "us").
+            region (str, optional): Force a specific region ("eu", "us", or "ap").
                 When *None* the region is derived automatically from *country_code*:
-                European countries use the EU endpoints, everything else uses US.
+                European countries → EU, Asia-Pacific/Oceania/ME/Africa → AP
+                (Singapore), everything else → US.
             
         Raises:
             ValidationError: If input validation fails
@@ -547,6 +549,95 @@ class CloudEdgeClient:
         except Exception as e:
             self._log(f"Failed to save session cache: {e}")
             
+    def _discover_endpoints(self) -> None:
+        """Call the global redirect API to discover the correct regional server.
+
+        The CloudEdge mobile app calls ``/ppstrongs/redirect`` on the global
+        gateway (``apis.cloudedge360.com``) **before** login.  The response
+        contains the regional ``apiServer`` and ``openapi`` domain that must be
+        used for the given account/country.
+
+        On success, ``self.BASE_URL`` and ``self.OPENAPI_BASE_URL`` are updated.
+        On failure the previously configured (static) endpoints are kept.
+        """
+        import random
+
+        timestamp = int(time.time() * 1000)
+        encrypted_account = self._aes_encode_param(
+            self.username, "/ppstrongs/redirect", timestamp=timestamp,
+        )
+        query_nonce = "".join(
+            [str(random.randint(0, 9)) for _ in range(8)]
+        )
+        header_nonce = str(random.randint(100000, 999999))
+
+        phone_code_bare = self.phone_code.lstrip("+")
+        params = {
+            "phoneType": "a",
+            "sourceApp": "8",
+            "appVer": "5.5.1",
+            "appVerCode": "551",
+            "localTime": str(timestamp),
+            "t": str(timestamp),
+            "lngType": "en",
+            "countryCode": self.country_code,
+            "userAccount": encrypted_account,
+            "phoneCode": phone_code_bare,
+            "partnerId": "8",
+            "nonce": query_nonce,
+        }
+
+        # sign = MD5("GET|/ppstrongs/redirect|{timestamp}|apis.meari.com.cn")
+        params["sign"] = hashlib.md5(
+            f"GET|/ppstrongs/redirect|{timestamp}|apis.meari.com.cn".encode()
+        ).hexdigest()
+
+        # X-Ca-Sign: HMAC-SHA1 with CA_SECRET as key
+        # The app builds: "api=/ppstrongs/" + getRealUrl(path) + "|X-Ca-Key=...|..."
+        # getRealUrl("/ppstrongs/redirect") returns "/ppstrongs/redirect" unchanged,
+        # so the full string is "api=/ppstrongs//ppstrongs/redirect|..."
+        ca_sign_data = (
+            f"api=/ppstrongs//ppstrongs/redirect"
+            f"|X-Ca-Key={CA_KEY}"
+            f"|X-Ca-Timestamp={timestamp}"
+            f"|X-Ca-Nonce={header_nonce}"
+        )
+        ca_signature = base64.b64encode(
+            hmac.new(CA_SECRET.encode(), ca_sign_data.encode(), hashlib.sha1).digest()
+        ).decode()
+
+        headers = {
+            **DEFAULT_HEADERS,
+            "X-Ca-Timestamp": str(timestamp),
+            "X-Ca-Sign": ca_signature,
+            "X-Ca-Key": CA_KEY,
+            "X-Ca-Nonce": header_nonce,
+        }
+
+        try:
+            resp = self._session.get(
+                REDIRECT_URL, params=params, headers=headers, timeout=DEFAULT_TIMEOUT,
+            )
+            data = resp.json()
+            if data.get("resultCode") != "1001":
+                self._log(f"Redirect discovery returned {data.get('resultCode')}")
+                return
+
+            result = data.get("result", {})
+            api_server = result.get("apiServer") or result.get("gwUrl") or ""
+            if api_server:
+                self.BASE_URL = api_server.rstrip("/")
+                self._log(f"Discovered API server: {self.BASE_URL}")
+
+            pf_api = result.get("pfApi", {})
+            openapi_domain = pf_api.get("openapi", {}).get("domain", "")
+            if openapi_domain:
+                self.OPENAPI_BASE_URL = openapi_domain.rstrip("/")
+                self._log(f"Discovered OpenAPI server: {self.OPENAPI_BASE_URL}")
+
+        except Exception as exc:
+            self._log(f"Endpoint discovery failed (will use static endpoints): {exc}")
+
     def authenticate(self) -> bool:
         """
         Authenticate with CloudEdge API.
@@ -562,6 +653,11 @@ class CloudEdgeClient:
         self.session_data = self._load_session_cache()
         if self.session_data:
             self._log("Using cached session")
+            # Restore discovered endpoints from cache if present
+            if self.session_data.get("apiServer"):
+                self.BASE_URL = self.session_data["apiServer"]
+            if self.session_data.get("openapiServer"):
+                self.OPENAPI_BASE_URL = self.session_data["openapiServer"]
             # Fetch MQTT config if not already present in the cached session
             if not self.session_data.get("mqtt"):
                 try:
@@ -570,7 +666,10 @@ class CloudEdgeClient:
                 except Exception as exc:
                     self._log(f"IoT config fetch failed (non-fatal): {exc}")
             return True
-            
+
+        # Discover the correct regional endpoints before login
+        self._discover_endpoints()
+
         self._log("Performing CloudEdge login...")
         
         # Encrypt credentials
@@ -660,6 +759,7 @@ class CloudEdgeClient:
                     "caKey": ca_key,
                     "loginTime": int(time.time()),
                     "apiServer": self.BASE_URL,
+                    "openapiServer": self.OPENAPI_BASE_URL,
                     "iotPlatformKeys": iot_platform_keys,
                 }
 
