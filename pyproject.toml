@@ -66,6 +66,7 @@ cloudedge = "cloudedge.cli:main"
 
 [tool.setuptools_scm]
 write_to = "cloudedge/_version.py"
+version_scheme = "only-version"
 
 [tool.setuptools.packages.find]
 where = ["."]
