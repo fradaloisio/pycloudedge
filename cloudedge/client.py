@@ -37,9 +37,7 @@ from .iot_parameters import (
 )
 from .constants import (
     CA_KEY, CA_SECRET, DEFAULT_HEADERS, DEFAULT_TIMEOUT,
-    REGION_ENDPOINTS, REGION_EU, REGION_US, REGION_AP,
     REDIRECT_URL,
-    region_for_country,
 )
 from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
@@ -132,7 +130,6 @@ class CloudEdgeClient:
         session_cache_file: str = ".cloudedge_session_cache",
         enable_network_ping: bool = True,
         ping_timeout: float = 2.0,
-        region: Optional[str] = None,
     ):
         """
         Initialize CloudEdge API client.
@@ -146,10 +143,6 @@ class CloudEdgeClient:
             session_cache_file (str): Path to session cache file
             enable_network_ping (bool): Enable ping-based online status when on same network
             ping_timeout (float): Ping timeout in seconds
-            region (str, optional): Force a specific region ("eu", "us", or "ap").
-                When *None* the region is derived automatically from *country_code*:
-                European countries → EU, Asia-Pacific/Oceania/ME/Africa → AP
-                (Singapore), everything else → US.
             
         Raises:
             ValidationError: If input validation fails
@@ -178,12 +171,9 @@ class CloudEdgeClient:
         self.country_code = country_code.upper()
         self.phone_code = phone_code if phone_code.startswith('+') else f'+{phone_code}'
         
-        # Resolve region and endpoints
-        resolved_region = region if region in REGION_ENDPOINTS else region_for_country(self.country_code)
-        endpoints = REGION_ENDPOINTS[resolved_region]
-        self.region = resolved_region
-        self.BASE_URL = endpoints["base_url"]
-        self.OPENAPI_BASE_URL = endpoints["openapi_base_url"]
+        # Endpoints are discovered dynamically via _discover_endpoints()
+        self.BASE_URL: Optional[str] = None
+        self.OPENAPI_BASE_URL: Optional[str] = None
         
         # Setup proper logging
         self.logger = get_logger("client")
@@ -557,8 +547,11 @@ class CloudEdgeClient:
         contains the regional ``apiServer`` and ``openapi`` domain that must be
         used for the given account/country.
 
-        On success, ``self.BASE_URL`` and ``self.OPENAPI_BASE_URL`` are updated.
-        On failure the previously configured (static) endpoints are kept.
+        On success, ``self.BASE_URL`` and ``self.OPENAPI_BASE_URL`` are set.
+
+        Raises:
+            NetworkError: If the redirect API call fails or returns an
+                unexpected response and no endpoints were previously set.
         """
         import random
 
@@ -593,9 +586,6 @@ class CloudEdgeClient:
         ).hexdigest()
 
         # X-Ca-Sign: HMAC-SHA1 with CA_SECRET as key
-        # The app builds: "api=/ppstrongs/" + getRealUrl(path) + "|X-Ca-Key=...|..."
-        # getRealUrl("/ppstrongs/redirect") returns "/ppstrongs/redirect" unchanged,
-        # so the full string is "api=/ppstrongs//ppstrongs/redirect|..."
         ca_sign_data = (
             f"api=/ppstrongs//ppstrongs/redirect"
             f"|X-Ca-Key={CA_KEY}"
@@ -620,8 +610,9 @@ class CloudEdgeClient:
             )
             data = resp.json()
             if data.get("resultCode") != "1001":
-                self._log(f"Redirect discovery returned {data.get('resultCode')}")
-                return
+                raise NetworkError(
+                    f"Redirect discovery returned unexpected code: {data.get('resultCode')}"
+                )
 
             result = data.get("result", {})
             api_server = result.get("apiServer") or result.get("gwUrl") or ""
@@ -635,8 +626,15 @@ class CloudEdgeClient:
                 self.OPENAPI_BASE_URL = openapi_domain.rstrip("/")
                 self._log(f"Discovered OpenAPI server: {self.OPENAPI_BASE_URL}")
 
+            if not self.BASE_URL:
+                raise NetworkError(
+                    "Redirect API did not return an apiServer"
+                )
+
+        except NetworkError:
+            raise
         except Exception as exc:
-            self._log(f"Endpoint discovery failed (will use static endpoints): {exc}")
+            raise NetworkError(f"Endpoint discovery failed: {exc}") from exc
 
     def authenticate(self) -> bool:
         """
