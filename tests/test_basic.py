@@ -181,7 +181,7 @@ class TestAsyncMethods(unittest.IsolatedAsyncioTestCase):
     
     async def test_client_methods_with_mock(self):
         """Test client methods with mocked dependencies."""
-        client = CloudEdgeClient("test", "test", "US", "+1")
+        client = CloudEdgeClient("test@example.com", "test", "US", "+1")
         
         # Test that methods require authentication
         with self.assertRaises(AuthenticationError):
