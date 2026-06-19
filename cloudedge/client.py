@@ -166,9 +166,13 @@ class CloudEdgeClient:
                 details={"field": "phone_code", "value": phone_code}
             )
         
+        normalized_country_code = country_code.upper()
+        if normalized_country_code == "UK":
+            normalized_country_code = "GB"
+
         self.username = username
         self.password = password
-        self.country_code = country_code.upper()
+        self.country_code = normalized_country_code
         self.phone_code = phone_code if phone_code.startswith('+') else f'+{phone_code}'
         
         # Endpoints are discovered dynamically via _discover_endpoints()

@@ -59,6 +59,15 @@ class TestPhase1InputValidation:
         assert client.country_code == "US"
         assert client.phone_code == "+1"
 
+    def test_uk_country_code_normalizes_to_gb(self):
+        """Test that UK input normalizes to GB for CloudEdge APIs."""
+        client = CloudEdgeClient("user@example.com", "password", "UK", "+44")
+
+        assert client.country_code == "GB"
+        assert client.phone_code == "+44"
+        assert client.BASE_URL is None
+        assert client.OPENAPI_BASE_URL is None
+
 
 class TestPhase1Logging:
     """Test Phase 1: Proper logging implementation"""
