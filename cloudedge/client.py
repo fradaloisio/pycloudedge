@@ -57,6 +57,27 @@ _DEVICE_LIST_CATEGORY_LABELS = {
     "chime": "Chime",
 }
 
+# Extra app fields needed by the native P2P streaming handshake.
+_APP_STREAMING_METADATA_FIELDS = {
+    "device_uuid": "deviceUUID",
+    "p2p_init": "p2pInit",
+    "device_p2p": "deviceP2P",
+    "relay_license_id": "relayLicenseID",
+    "host_key1": "hostKey1",
+    "share_access_sign": "shareAccessSign",
+    "as_friend": "asFriend",
+    "device_region": "region",
+}
+
+
+def _extract_app_streaming_metadata(device: Dict[str, Any]) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    for normalized_key, source_key in _APP_STREAMING_METADATA_FIELDS.items():
+        value = device.get(source_key)
+        if value not in (None, ""):
+            metadata[normalized_key] = value
+    return metadata
+
 
 def _device_icon_url_from_type_name(device_type_name: Any) -> Optional[str]:
     """Return URL if deviceTypeName is an http(s) icon URL (Meari/OSS), else None."""
@@ -197,6 +218,28 @@ class CloudEdgeClient:
         self._local_network = None
         self._network_detected = False
         
+    def create_streamer(
+        self,
+        device: Dict[str, Any],
+        on_video=None,
+        on_audio=None,
+        on_login=None,
+        on_disconnect=None,
+        remote: bool = False,
+    ):
+        """Create a native P2P streamer for a CloudEdge camera device."""
+        from .p2p.p2p_streamer import P2PStreamer
+
+        return P2PStreamer(
+            api=self,
+            device=device,
+            on_video=on_video,
+            on_audio=on_audio,
+            on_login=on_login,
+            on_disconnect=on_disconnect,
+            remote=remote,
+        )
+
     def _detect_local_network(self) -> Optional[str]:
         """Detect the local network subnet."""
         if self._network_detected:
@@ -1117,6 +1160,7 @@ class CloudEdgeClient:
                                     'online': device.get('devStatus') == 1,  # Store original API status
                                     'home_id': home_id,
                                     'device_icon_url': icon_url,
+                                    **_extract_app_streaming_metadata(device),
                                 }
                                 
                                 # Get enhanced online status
@@ -1263,6 +1307,7 @@ class CloudEdgeClient:
                             'host_key': device.get('hostKey'),
                             'online': device.get('onLine') == 1,
                             'device_icon_url': icon_url,
+                            **_extract_app_streaming_metadata(device),
                         }
                         device_dict['online'] = self._get_enhanced_device_status(device_dict)
                         standardized_devices.append(device_dict)
@@ -1285,6 +1330,7 @@ class CloudEdgeClient:
                                 'host_key': device.get('hostKey'),
                                 'online': device.get('onLine') == 1,
                                 'device_icon_url': icon_url,
+                                **_extract_app_streaming_metadata(device),
                             }
                             device_dict['online'] = self._get_enhanced_device_status(device_dict)
                             standardized_devices.append(device_dict)
