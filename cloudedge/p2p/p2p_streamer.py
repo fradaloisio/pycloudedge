@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 from Crypto.Cipher import DES3
 
 from .meari_signaling import MsgSvrClient
+from .root_discovery import discover_msgsvr_endpoints
 from .turn_client import (
     TurnClient,
     _parse_stun,
@@ -71,6 +72,10 @@ _SIGNAL_STATUS_RETRY_WINDOW = 20.0
 _SIGNAL_STATUS_RETRY_POLL = 1.0
 _KCP_GAP_NUDGE_DELAY = 0.2
 _KCP_GAP_SKIP_DELAY = 2.0
+# After this many seconds without a video frame, end the P2P session so the
+# caller can re-establish a fresh live window (the camera's live grant is finite
+# and START_LIVE reissue does not revive a stalled stream).
+_VIDEO_STALL_END_SESSION = 6.0
 
 
 # ---------------------------------------------------------------------------
@@ -137,17 +142,28 @@ def _resolve_signaling_candidates(
 ) -> list[tuple[str, int]]:
     candidates: list[tuple[str, int]] = []
 
+    openapi_base = getattr(api, "OPENAPI_BASE_URL", "")
+    mqtt_host = ((getattr(api, "session_data", None) or {}).get("mqtt") or {}).get(
+        "mqtt_host", ""
+    )
+    client_id = (getattr(api, "session_data", None) or {}).get("userID")
+    discovered = discover_msgsvr_endpoints(
+        platform_domain_hint=mqtt_host,
+        openapi_server_hint=openapi_base,
+        api_server_hint=getattr(api, "BASE_URL", ""),
+        client_id_hint=client_id,
+    )
+    candidates.extend(discovered)
+
     def add_region_host(host: str) -> None:
         if not host:
             return
         candidates.append((host, 28974))
-        candidates.append((host, 9253))
         try:
             resolved_ip = socket.gethostbyname(host)
         except socket.gaierror:
             return
         candidates.append((resolved_ip, 28974))
-        candidates.append((resolved_ip, 9253))
 
     def add_device_region_hosts() -> None:
         if not device:
@@ -161,16 +177,10 @@ def _resolve_signaling_candidates(
         elif "australia/" in region or "asia/" in region or "pacific/" in region:
             add_region_host("usce.mearicloud.com")
 
-    add_device_region_hosts()
-
-    openapi_base = getattr(api, "OPENAPI_BASE_URL", "")
     openapi_host = urlparse(openapi_base).hostname or ""
     if openapi_host.startswith("openapi-") and openapi_host.endswith(".mearicloud.com"):
         add_region_host(openapi_host[len("openapi-") :])
 
-    mqtt_host = ((getattr(api, "session_data", None) or {}).get("mqtt") or {}).get(
-        "mqtt_host", ""
-    )
     if (
         isinstance(mqtt_host, str)
         and mqtt_host.startswith("events-")
@@ -184,6 +194,8 @@ def _resolve_signaling_candidates(
         "ap": "usce.mearicloud.com",
     }
     add_region_host(region_hosts.get(getattr(api, "region", ""), ""))
+
+    add_device_region_hosts()
 
     add_region_host("euce.mearicloud.com")
     candidates.append(("47.254.142.96", 28974))
@@ -385,6 +397,8 @@ class P2PStreamer:
         on_login: Callable[[], None] | None = None,
         on_disconnect: Callable[[], None] | None = None,
         remote: bool = False,
+        video_id: int = 0,
+        manage_stream_switch: bool = True,
     ) -> None:
         self._api = api
         self._device = device
@@ -398,6 +412,10 @@ class P2PStreamer:
         self.on_login = on_login
         self.on_disconnect = on_disconnect
         self._remote = remote
+        if not 0 <= video_id <= 0xFF:
+            raise ValueError("video_id must be between 0 and 255")
+        self._video_id = video_id
+        self._manage_stream_switch = manage_stream_switch
 
         self._running = False
         self._video_count = 0
@@ -433,10 +451,48 @@ class P2PStreamer:
         self._total_bytes = 0
 
         last_error: Exception | None = None
+        stream_switch_enabled = False
         try:
-            for sig_host, sig_port in _resolve_signaling_candidates(
+            refresh_metadata = getattr(
+                self._api, "refresh_streaming_metadata", None
+            )
+            if callable(refresh_metadata):
+                refresh_metadata(self._device)
+                self._sn_num = self._device.get("serial_number", self._sn_num)
+                self._device_uuid = (
+                    self._device.get("device_uuid") or format_sn(self._sn_num)
+                )
+                self._host_key = self._device.get("host_key", self._host_key)
+
+            set_config = getattr(self._api, "set_device_config", None)
+            if self._manage_stream_switch and callable(set_config) and self._sn_num:
+                try:
+                    stream_switch_enabled = bool(
+                        set_config(
+                            self._sn_num,
+                            {"167": 1},
+                            auto_wake=False,
+                            device_id=self._device.get("device_id"),
+                        )
+                    )
+                except Exception as exc:
+                    _LOGGER.debug(
+                        "Could not enable device live-stream switch for %s: %s",
+                        self._sn_num,
+                        exc,
+                    )
+
+            signaling_candidates = _resolve_signaling_candidates(
                 self._api, self._device
-            ):
+            )
+            _LOGGER.debug(
+                "P2P signaling candidates for %s: %s",
+                self._sn_num,
+                signaling_candidates,
+            )
+            for sig_host, sig_port in signaling_candidates:
+                if not self._running:
+                    break
                 sig = None
                 try:
                     _LOGGER.debug("Connecting to signaling %s:%d", sig_host, sig_port)
@@ -454,12 +510,14 @@ class P2PStreamer:
                     _LOGGER.warning("%s", last_error)
                 except Exception as exc:
                     last_error = exc
-                    _LOGGER.warning(
-                        "P2P signaling attempt failed via %s:%d: %s",
-                        sig_host,
-                        sig_port,
-                        exc,
-                    )
+                    if self._running:
+                        _LOGGER.warning(
+                            "P2P signaling attempt failed via %s:%d: %s",
+                            sig_host,
+                            sig_port,
+                            exc,
+                        )
+                        _LOGGER.debug("P2P candidate failure", exc_info=True)
                 finally:
                     if sig:
                         try:
@@ -471,6 +529,20 @@ class P2PStreamer:
                 _LOGGER.error("P2P session error: %s", last_error)
             return (self._video_count, self._total_bytes)
         finally:
+            if stream_switch_enabled:
+                try:
+                    self._api.set_device_config(
+                        self._sn_num,
+                        {"167": 0},
+                        auto_wake=False,
+                        device_id=self._device.get("device_id"),
+                    )
+                except Exception as exc:
+                    _LOGGER.debug(
+                        "Could not disable device live-stream switch for %s: %s",
+                        self._sn_num,
+                        exc,
+                    )
             if self.on_disconnect:
                 try:
                     self.on_disconnect()
@@ -864,18 +936,24 @@ class P2PStreamer:
 
         def _send_ice_checks():
             for c in camera_candidates:
-                turn.send_ice_binding(
-                    c["ip"], c["port"], ice_ufrag, camera_ufrag, camera_pwd
-                )
-                if not remote and _is_private_ip(c["ip"]):
-                    _send_direct_ice_binding(
-                        turn.sock,
-                        c["ip"],
-                        c["port"],
-                        ice_ufrag,
-                        camera_ufrag,
-                        camera_pwd,
+                try:
+                    turn.send_ice_binding(
+                        c["ip"], c["port"], ice_ufrag, camera_ufrag, camera_pwd
                     )
+                except OSError:
+                    pass
+                if not remote and _is_private_ip(c["ip"]):
+                    try:
+                        _send_direct_ice_binding(
+                            turn.sock,
+                            c["ip"],
+                            c["port"],
+                            ice_ufrag,
+                            camera_ufrag,
+                            camera_pwd,
+                        )
+                    except OSError:
+                        pass
 
         _send_ice_checks()
 
@@ -887,6 +965,7 @@ class P2PStreamer:
             seq=vvp_seq,
             host_key=host_key,
             param=8,
+            video_id=self._video_id,
             licence_id=licence_id,
         )
         vvp_seq += 1
@@ -974,6 +1053,23 @@ class P2PStreamer:
         while self._running and time.time() < ice_deadline:
             now = time.time()
 
+            # End the session on a sustained video stall even though KCP/heartbeat
+            # traffic keeps the channel (and ice_deadline) alive. The camera grants
+            # a finite ~15-19s live window then stops video while keeping the
+            # channel up; without this the session never returns and the caller
+            # cannot re-establish a fresh window.
+            if (
+                login_ok
+                and last_video_time
+                and now - last_video_time > _VIDEO_STALL_END_SESSION
+            ):
+                _LOGGER.info(
+                    "Video stalled for %.0fs (live window ended); ending session "
+                    "for reconnect",
+                    now - last_video_time,
+                )
+                break
+
             # Heartbeats
             if login_ok and now >= heartbeat_at:
                 hb = build_vvp_packet(
@@ -1053,7 +1149,10 @@ class P2PStreamer:
                     if inner_stun["type"] == BINDING_REQUEST:
                         pip, pport = peer if peer else (addr[0], addr[1])
                         resp = _build_ice_response(inner_stun, ice_pwd, pip, pport)
-                        turn.send_to_peer(pip, pport, resp)
+                        try:
+                            turn.send_to_peer(pip, pport, resp)
+                        except OSError:
+                            pass
                         ice_count += 1
                         request_addrs.add((pip, pport))
                         continue
@@ -1076,7 +1175,10 @@ class P2PStreamer:
                         inner_msg = _parse_stun(inner_data)
                         if inner_msg and inner_msg["type"] == BINDING_REQUEST:
                             resp = _build_ice_response(inner_msg, ice_pwd, pip, pport)
-                            turn.send_to_peer(pip, pport, resp)
+                            try:
+                                turn.send_to_peer(pip, pport, resp)
+                            except OSError:
+                                pass
                             ice_count += 1
                             request_addrs.add((pip, pport))
                             if (
@@ -1107,10 +1209,13 @@ class P2PStreamer:
                         via_turn = True
                     elif msg["type"] == BINDING_REQUEST:
                         resp = _build_ice_response(msg, ice_pwd, addr[0], addr[1])
-                        if not remote and _is_private_ip(addr[0]):
-                            turn.sock.sendto(resp, addr)
-                        else:
-                            turn.send_to_peer(addr[0], addr[1], resp)
+                        try:
+                            if not remote and _is_private_ip(addr[0]):
+                                turn.sock.sendto(resp, addr)
+                            else:
+                                turn.send_to_peer(addr[0], addr[1], resp)
+                        except OSError:
+                            pass
                         ice_count += 1
                         request_addrs.add(addr)
                         continue
@@ -1266,6 +1371,8 @@ class P2PStreamer:
         video_frame_count = video_count_start
         total_bytes = bytes_start
         last_video_time: float | None = None
+        if video_frame_count:
+            last_video_time = time.time()
         last_kcp_data_time = time.time()
         last_nudge_time = 0.0
         last_skip_time = 0.0
@@ -1385,6 +1492,21 @@ class P2PStreamer:
                     if last_kcp_data_time and now - last_kcp_data_time > 20:
                         _LOGGER.debug("No KCP data for 20s, ending session")
                         break
+                    # The camera grants a finite live window (~15-20s) after
+                    # which it stops sending video even though heartbeats keep
+                    # the channel alive. START_LIVE reissue does not revive it,
+                    # so end the session promptly on a sustained video stall and
+                    # let the caller re-establish a fresh window.
+                    if (
+                        last_video_time
+                        and now - last_video_time > _VIDEO_STALL_END_SESSION
+                    ):
+                        _LOGGER.info(
+                            "Video stalled for %.0fs (live window ended); "
+                            "ending session for reconnect",
+                            now - last_video_time,
+                        )
+                        break
                     if last_video_time and now - last_video_time > _KCP_GAP_NUDGE_DELAY:
                         if now - last_nudge_time > _KCP_GAP_NUDGE_DELAY:
                             kcp.send_gap_nudge()
@@ -1420,7 +1542,10 @@ class P2PStreamer:
                         peer = turn.reverse_channels.get(ch)
                         pip, pport = peer if peer else (addr[0], addr[1])
                         resp = _build_ice_response(inner_stun, ice_pwd, pip, pport)
-                        turn.send_to_peer(pip, pport, resp)
+                        try:
+                            turn.send_to_peer(pip, pport, resp)
+                        except OSError:
+                            pass
                         continue
                     elif inner_stun["type"] == BINDING_RESPONSE:
                         continue
@@ -1441,15 +1566,21 @@ class P2PStreamer:
                             and ice_pwd
                         ):
                             resp = _build_ice_response(inner_msg, ice_pwd, pip, pport)
-                            turn.send_to_peer(pip, pport, resp)
+                            try:
+                                turn.send_to_peer(pip, pport, resp)
+                            except OSError:
+                                pass
                             continue
                         data = inner
                     elif msg["type"] == BINDING_REQUEST and ice_pwd:
                         resp = _build_ice_response(msg, ice_pwd, addr[0], addr[1])
-                        if _is_private_ip(addr[0]):
-                            turn.sock.sendto(resp, addr)
-                        else:
-                            turn.send_to_peer(addr[0], addr[1], resp)
+                        try:
+                            if _is_private_ip(addr[0]):
+                                turn.sock.sendto(resp, addr)
+                            else:
+                                turn.send_to_peer(addr[0], addr[1], resp)
+                        except OSError:
+                            pass
                         continue
                     else:
                         continue

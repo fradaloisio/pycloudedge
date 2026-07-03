@@ -226,6 +226,8 @@ class CloudEdgeClient:
         on_login=None,
         on_disconnect=None,
         remote: bool = False,
+        video_id: int = 0,
+        manage_stream_switch: bool = True,
     ):
         """Create a native P2P streamer for a CloudEdge camera device."""
         from .p2p.p2p_streamer import P2PStreamer
@@ -238,7 +240,38 @@ class CloudEdgeClient:
             on_login=on_login,
             on_disconnect=on_disconnect,
             remote=remote,
+            video_id=video_id,
+            manage_stream_switch=manage_stream_switch,
         )
+
+    def refresh_streaming_metadata(self, device: Dict[str, Any]) -> Dict[str, Any]:
+        """Refresh account-specific identifiers used by the P2P handshake.
+
+        The same physical camera can have different device IDs and host keys
+        when it is accessed through accounts in different regions. Always use
+        the values returned by the currently authenticated account.
+        """
+        serial_number = device.get("serial_number")
+        if not serial_number:
+            return device
+
+        try:
+            current_devices = self.get_all_devices()
+        except Exception as exc:
+            self._log(
+                f"Could not refresh streaming metadata for {serial_number}: {exc}"
+            )
+            return device
+
+        for current_device in current_devices:
+            if current_device.get("serial_number") == serial_number:
+                device.update(current_device)
+                self._log(
+                    f"Refreshed account-specific streaming metadata for {serial_number}"
+                )
+                break
+
+        return device
 
     def _detect_local_network(self) -> Optional[str]:
         """Detect the local network subnet."""
@@ -1282,7 +1315,6 @@ class CloudEdgeClient:
                 
                 # Debug: Log the actual response structure
                 if self.debug:
-                    import json
                     self._log(f"API Response structure: {json.dumps(response_data, indent=2)}")
                 
                 device_types = ['nvr', 'ipc', 'chime', 'doorbell', 'snap']
@@ -1855,6 +1887,7 @@ class CloudEdgeClient:
             'signature': signature,
             'action': 'set',
             'deviceid': formatted_sn,
+            'target': 'server',
             'params': params_b64
         }
         
