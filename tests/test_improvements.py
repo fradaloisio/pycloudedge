@@ -4,7 +4,9 @@ Tests input validation, logging, error handling, and utility modules.
 """
 
 import pytest
+import json
 import logging
+import stat
 from unittest.mock import Mock, patch, MagicMock
 import requests
 
@@ -254,6 +256,16 @@ class TestIntegration:
             response = client._make_request('GET', 'https://test.com')
             assert response.status_code == 200
             assert mock_request.call_count == 3
+
+    def test_make_request_applies_default_timeout(self):
+        response = Mock()
+        response.raise_for_status = Mock()
+        client = CloudEdgeClient("user@example.com", "password", "US", "+1")
+
+        with patch.object(client._session, "request", return_value=response) as request:
+            client._make_request("GET", "https://example.test")
+
+        assert request.call_args.kwargs["timeout"] == DEFAULT_TIMEOUT
     
     def test_client_initialization_with_all_features(self):
         """Test that client initializes with all new features"""
@@ -326,6 +338,49 @@ class TestSessionInvalidHandling:
         ):
             with pytest.raises(AuthenticationError):
                 client.get_all_devices()
+
+    def test_force_refresh_skips_cached_session(self):
+        client = self._authenticated_client()
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {
+            "resultCode": "1001",
+            "result": {"userToken": "fresh-token", "userID": "user-id"},
+        }
+
+        with (
+            patch.object(client, "_load_session_cache") as load_cache,
+            patch.object(client, "_discover_endpoints"),
+            patch.object(client, "_aes_encode_param", return_value="account"),
+            patch.object(client, "_des_encode", return_value="password"),
+            patch.object(client._session, "post", return_value=response),
+            patch.object(client, "_fetch_iot_config"),
+            patch.object(client, "_save_session_cache"),
+        ):
+            assert client.authenticate(force_refresh=True) is True
+
+        load_cache.assert_not_called()
+        assert client.session_data["userToken"] == "fresh-token"
+
+
+def test_session_cache_is_private_and_atomic(tmp_path):
+    cache_path = tmp_path / "session.json"
+    client = CloudEdgeClient(
+        "user@example.com",
+        "password",
+        "US",
+        "+1",
+        session_cache_file=str(cache_path),
+    )
+
+    client._save_session_cache({"userToken": "secret", "loginTime": 1})
+
+    assert json.loads(cache_path.read_text()) == {
+        "userToken": "secret",
+        "loginTime": 1,
+    }
+    assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
+    assert list(tmp_path.glob(".session.json.*.tmp")) == []
 
 
 if __name__ == "__main__":

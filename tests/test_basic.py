@@ -7,8 +7,7 @@ Simple tests to verify library functionality.
 """
 
 import unittest
-import asyncio
-from unittest.mock import Mock, patch, AsyncMock
+from unittest.mock import Mock, patch
 import sys
 import os
 
@@ -76,8 +75,7 @@ class TestCloudEdgeClient(unittest.TestCase):
         # Test empty SN
         self.assertEqual(self.client._format_sn(""), "")
 
-    @patch("cloudedge.client.requests.Session.post")
-    async def test_authenticate_success(self, mock_post):
+    def test_authenticate_success(self):
         """Test successful authentication."""
         # Mock successful login response
         mock_response = Mock()
@@ -96,18 +94,22 @@ class TestCloudEdgeClient(unittest.TestCase):
             },
         }
         mock_response.raise_for_status.return_value = None
-        mock_post.return_value = mock_response
-
-        # Test authentication
-        success = await self.client.authenticate()
+        with (
+            patch.object(self.client, "_discover_endpoints"),
+            patch.object(self.client, "_aes_encode_param", return_value="account"),
+            patch.object(self.client, "_des_encode", return_value="password"),
+            patch.object(self.client._session, "post", return_value=mock_response),
+            patch.object(self.client, "_fetch_iot_config"),
+            patch.object(self.client, "_save_session_cache"),
+        ):
+            success = self.client.authenticate(force_refresh=True)
 
         self.assertTrue(success)
         self.assertIsNotNone(self.client.session_data)
         self.assertEqual(self.client.session_data["userToken"], "test_token")
         self.assertEqual(self.client.session_data["userID"], "test_user_id")
 
-    @patch("cloudedge.client.requests.Session.post")
-    async def test_authenticate_failure(self, mock_post):
+    def test_authenticate_failure(self):
         """Test failed authentication."""
         # Mock failed login response
         mock_response = Mock()
@@ -117,19 +119,21 @@ class TestCloudEdgeClient(unittest.TestCase):
             "resultMsg": "Invalid credentials",
         }
         mock_response.raise_for_status.return_value = None
-        mock_post.return_value = mock_response
+        with (
+            patch.object(self.client, "_discover_endpoints"),
+            patch.object(self.client, "_aes_encode_param", return_value="account"),
+            patch.object(self.client, "_des_encode", return_value="password"),
+            patch.object(self.client._session, "post", return_value=mock_response),
+            self.assertRaises(AuthenticationError),
+        ):
+            self.client.authenticate(force_refresh=True)
 
-        # Test authentication failure
-        with self.assertRaises(AuthenticationError):
-            await self.client.authenticate()
-
-    async def test_get_devices_not_authenticated(self):
+    def test_get_devices_not_authenticated(self):
         """Test getting devices without authentication."""
         with self.assertRaises(AuthenticationError):
-            await self.client.get_devices()
+            self.client.get_devices()
 
-    @patch("cloudedge.client.requests.Session.post")
-    async def test_get_devices_success(self, mock_post):
+    def test_get_devices_success(self):
         """Test successful device retrieval."""
         # Set up authenticated session
         self.client.session_data = {"userToken": "test_token", "userID": "test_user_id"}
@@ -154,10 +158,8 @@ class TestCloudEdgeClient(unittest.TestCase):
             },
         }
         mock_response.raise_for_status.return_value = None
-        mock_post.return_value = mock_response
-
-        # Test device retrieval
-        devices = await self.client.get_devices()
+        with patch.object(self.client, "_make_request", return_value=mock_response):
+            devices = self.client.get_devices()
 
         self.assertEqual(len(devices), 1)
         device = devices[0]
@@ -165,31 +167,25 @@ class TestCloudEdgeClient(unittest.TestCase):
         self.assertEqual(device["name"], "Test Camera")
         self.assertTrue(device["online"])
 
-    async def test_find_device_by_name_not_authenticated(self):
+    def test_find_device_by_name_not_authenticated(self):
         """Test finding device without authentication."""
-        # Mock get_devices to raise AuthenticationError
-        with patch.object(
-            self.client,
-            "get_devices",
-            side_effect=AuthenticationError("Not authenticated"),
-        ):
-            result = await self.client.find_device_by_name("Test Device")
-            self.assertIsNone(result)
+        with self.assertRaises(AuthenticationError):
+            self.client.find_device_by_name("Test Device")
 
 
-class TestAsyncMethods(unittest.IsolatedAsyncioTestCase):
-    """Test async methods with proper async test support."""
+class TestAuthenticatedGuards(unittest.TestCase):
+    """Test authentication guards on synchronous client methods."""
 
-    async def test_client_methods_with_mock(self):
+    def test_client_methods_with_mock(self):
         """Test client methods with mocked dependencies."""
         client = CloudEdgeClient("test@example.com", "test", "US", "+1")
 
         # Test that methods require authentication
         with self.assertRaises(AuthenticationError):
-            await client.get_devices()
+            client.get_devices()
 
         with self.assertRaises(AuthenticationError):
-            await client.get_device_status("device1")
+            client.get_device_status("device1")
 
 
 def run_tests():
@@ -200,7 +196,7 @@ def run_tests():
     # Add test classes
     suite.addTests(loader.loadTestsFromTestCase(TestIoTParameters))
     suite.addTests(loader.loadTestsFromTestCase(TestCloudEdgeClient))
-    suite.addTests(loader.loadTestsFromTestCase(TestAsyncMethods))
+    suite.addTests(loader.loadTestsFromTestCase(TestAuthenticatedGuards))
 
     # Run tests
     runner = unittest.TextTestRunner(verbosity=2)
