@@ -465,6 +465,9 @@ class CloudEdgeClient:
     @retry_on_failure(max_attempts=3, delay=1.0)
     def _make_request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Make HTTP request with retry logic and error handling."""
+        # Never issue a request without a timeout: a hung connection would
+        # otherwise block the caller (and its thread) forever.
+        kwargs.setdefault('timeout', DEFAULT_TIMEOUT)
         try:
             response = self._session.request(method, url, **kwargs)
             response.raise_for_status()
