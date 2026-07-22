@@ -1406,7 +1406,35 @@ class P2PStreamer:
 
         # Connection loop done — enter continuation receiver if we got video
         if not login_ok:
-            _LOGGER.warning("VVP login failed")
+            last_kcp_age = (
+                round(time.time() - last_kcp_data_time, 1)
+                if last_kcp_data_time
+                else None
+            )
+            candidate_summary = [
+                f"{candidate.get('type', 'unknown')}@"
+                f"{candidate.get('ip', '?')}:{candidate.get('port', '?')}"
+                for candidate in camera_candidates
+            ]
+            _LOGGER.warning(
+                "VVP login failed: video_id=%s candidates=%s target=%s:%s "
+                "ice_events=%s ice_confirmed=%s iva_handshake=%s "
+                "kcp_pushes=%s kcp_acks=%s kcp_unacked=%s "
+                "last_kcp_age=%s confirmed_peer=%s direct_peer=%s",
+                self._video_id,
+                candidate_summary,
+                target_ip,
+                target_port,
+                ice_count,
+                confirmed_addr,
+                got_iva_handshake,
+                kcp_push_count,
+                len(kcp.acked_sns),
+                len(kcp.sent_segments),
+                last_kcp_age,
+                confirmed_peer[0],
+                direct_addr,
+            )
             return (stream_video_count, stream_total_bytes)
 
         if (
