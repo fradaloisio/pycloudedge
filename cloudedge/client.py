@@ -601,25 +601,37 @@ class CloudEdgeClient:
         try:
             with open(self.session_cache_file, 'r') as f:
                 session_data = json.load(f)
-                
+
             # Check if session is still valid (not older than 24 hours)
             login_time = session_data.get('loginTime', 0)
             if time.time() - login_time > 86400:  # 24 hours
                 self._log("Session cache expired")
                 return None
-                
+
             return session_data
-        except (json.JSONDecodeError, KeyError):
-            self._log("Invalid session cache file")
+        except (json.JSONDecodeError, KeyError, OSError):
+            self._log("Invalid or unreadable session cache file")
             return None
-            
+
     def _save_session_cache(self, session_data: Dict) -> None:
-        """Save session data to cache file."""
+        """Save session data to cache file.
+
+        The cache contains the account session token, so it is written
+        owner-only (0600) and atomically (temp file + rename) so a crash
+        mid-write can never leave a truncated file behind.
+        """
+        tmp_path = f"{self.session_cache_file}.tmp"
         try:
-            with open(self.session_cache_file, 'w') as f:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as f:
                 json.dump(session_data, f)
+            os.replace(tmp_path, self.session_cache_file)
         except Exception as e:
             self._log(f"Failed to save session cache: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
             
     def _discover_endpoints(self) -> None:
         """Call the global redirect API to discover the correct regional server.
