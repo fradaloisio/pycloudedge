@@ -118,6 +118,13 @@ def _is_private_ip(ip: str) -> bool:
     return False
 
 
+def _is_direct_peer_path(
+    *, remote: bool, via_turn: bool, peer_ip: str, turn_server_ip: str
+) -> bool:
+    """Return whether a packet arrived directly from a nominated ICE peer."""
+    return not remote and not via_turn and peer_ip != turn_server_ip
+
+
 def _get_local_ips() -> list[str]:
     ips: list[str] = []
     try:
@@ -954,7 +961,7 @@ class P2PStreamer:
         # ICE + KCP + VVP combined phase
         camera_addrs = {(c["ip"], c["port"]) for c in camera_candidates}
         confirmed_peer: list = [None]
-        send_addr_holder: list = [None]
+        direct_send_addrs: set[tuple[str, int]] = set()
 
         def _udp_send(data):
             if confirmed_peer[0]:
@@ -980,13 +987,9 @@ class P2PStreamer:
                     turn.send_to_peer(c["ip"], c["port"], data)
                 except Exception:
                     pass
-            if (
-                not remote
-                and send_addr_holder[0]
-                and _is_private_ip(send_addr_holder[0][0])
-            ):
+            for direct_send_addr in tuple(direct_send_addrs):
                 try:
-                    turn.sock.sendto(data, send_addr_holder[0])
+                    turn.sock.sendto(data, direct_send_addr)
                 except Exception:
                     pass
 
@@ -1000,7 +1003,7 @@ class P2PStreamer:
                     )
                 except OSError:
                     pass
-                if not remote and _is_private_ip(c["ip"]):
+                if not remote and c.get("type") != "relay":
                     try:
                         _send_direct_ice_binding(
                             turn.sock,
@@ -1287,7 +1290,13 @@ class P2PStreamer:
                     elif msg["type"] == BINDING_REQUEST:
                         resp = _build_ice_response(msg, ice_pwd, addr[0], addr[1])
                         try:
-                            if not remote and _is_private_ip(addr[0]):
+                            if _is_direct_peer_path(
+                                remote=remote,
+                                via_turn=False,
+                                peer_ip=addr[0],
+                                turn_server_ip=turn.server_ip,
+                            ):
+                                direct_send_addrs.add(addr)
                                 turn.sock.sendto(resp, addr)
                             else:
                                 turn.send_to_peer(addr[0], addr[1], resp)
@@ -1300,12 +1309,8 @@ class P2PStreamer:
                         if addr[0] == turn.server_ip:
                             continue
                         confirmed_addr = addr
-                        if (
-                            not remote
-                            and not send_addr_holder[0]
-                            and addr[0] != coturn_ip
-                        ):
-                            send_addr_holder[0] = addr
+                        if not remote and addr[0] != coturn_ip:
+                            direct_send_addrs.add(addr)
                             direct_addr = addr
                             kcp.retransmit_unacked()
                         continue
@@ -1322,8 +1327,11 @@ class P2PStreamer:
                     last_kcp_data_time = time.time()
                     if not confirmed_peer[0] and source_addr:
                         cp_ip, cp_port = source_addr
-                        is_direct = (
-                            not via_turn and not remote and _is_private_ip(cp_ip)
+                        is_direct = _is_direct_peer_path(
+                            remote=remote,
+                            via_turn=via_turn,
+                            peer_ip=cp_ip,
+                            turn_server_ip=turn.server_ip,
                         )
                         confirmed_peer[0] = (cp_ip, cp_port, is_direct)
                 if result:
@@ -1338,7 +1346,7 @@ class P2PStreamer:
                                 if matching:
                                     direct_addr = matching.pop()
                             if direct_addr and direct_addr[0] != coturn_ip:
-                                send_addr_holder[0] = direct_addr
+                                direct_send_addrs.add(direct_addr)
                     elif rtype == "data" and rdata:
                         payload = rdata
                         if len(rdata) >= 20 and rdata[0] == 0xFF and rdata[1] == 0x01:
@@ -1420,7 +1428,8 @@ class P2PStreamer:
                 "VVP login failed: video_id=%s candidates=%s target=%s:%s "
                 "ice_events=%s ice_confirmed=%s iva_handshake=%s "
                 "kcp_pushes=%s kcp_acks=%s kcp_unacked=%s "
-                "last_kcp_age=%s confirmed_peer=%s direct_peer=%s",
+                "last_kcp_age=%s confirmed_peer=%s direct_peer=%s "
+                "direct_send_addrs=%s",
                 self._video_id,
                 candidate_summary,
                 target_ip,
@@ -1434,6 +1443,7 @@ class P2PStreamer:
                 last_kcp_age,
                 confirmed_peer[0],
                 direct_addr,
+                sorted(direct_send_addrs),
             )
             return (stream_video_count, stream_total_bytes)
 

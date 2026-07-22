@@ -11,6 +11,7 @@ from cloudedge.p2p.p2p_streamer import (
     STREAM_TYPE_PFRAME,
     VVP_CMD_START_LIVE,
     VVP_CMD_STOP,
+    _is_direct_peer_path,
     _resolve_signaling_candidates,
     parse_stream_frame,
 )
@@ -25,6 +26,36 @@ class _RegionApi:
     OPENAPI_BASE_URL = "https://openapi-usce.mearicloud.com"
     region = "us"
     session_data = {"mqtt": {"mqtt_host": "events-usce.mearicloud.com"}}
+
+
+def test_public_udp_peer_is_direct_after_ice_nomination():
+    assert _is_direct_peer_path(
+        remote=False,
+        via_turn=False,
+        peer_ip="79.19.244.115",
+        turn_server_ip="18.133.62.87",
+    )
+
+
+def test_relayed_or_forced_remote_peer_is_not_direct():
+    assert not _is_direct_peer_path(
+        remote=False,
+        via_turn=True,
+        peer_ip="79.19.244.115",
+        turn_server_ip="18.133.62.87",
+    )
+    assert not _is_direct_peer_path(
+        remote=True,
+        via_turn=False,
+        peer_ip="79.19.244.115",
+        turn_server_ip="18.133.62.87",
+    )
+    assert not _is_direct_peer_path(
+        remote=False,
+        via_turn=False,
+        peer_ip="18.133.62.87",
+        turn_server_ip="18.133.62.87",
+    )
 
 
 class _RunSessionApi:
