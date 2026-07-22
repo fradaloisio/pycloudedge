@@ -1292,7 +1292,11 @@ class CloudEdgeClient:
                     self._log(f"Failed to get devices from home '{home_name}': {e}")
                     
             return all_devices
-            
+
+        except AuthenticationError:
+            # Must propagate as-is: callers re-authenticate on this type,
+            # wrapping it in CloudEdgeError would hide the recovery signal.
+            raise
         except Exception as e:
             raise CloudEdgeError(f"Failed to get devices from homes: {e}")
             
