@@ -15,6 +15,7 @@ from cloudedge.p2p.p2p_streamer import (
     _build_xts_sdp_offer,
     _is_direct_peer_path,
     _resolve_signaling_candidates,
+    build_vvp_packet,
     parse_stream_frame,
 )
 from cloudedge.p2p.turn_client import (
@@ -89,6 +90,20 @@ def test_xts_ice_success_response_is_empty_like_android_client():
         "txn_id": transaction_id,
         "attrs": {},
     }
+
+
+def test_vvp_start_live_tail_matches_android_wire_format():
+    packet = build_vvp_packet(
+        cmd=VVP_CMD_START_LIVE,
+        seq=0,
+        host_key="f27e4ab4f344f2b50dfdfbb7f5da0757",
+        param=8,
+        video_id=105,
+        licence_id="ppsl24c26614e48746ef",
+    )
+
+    assert packet[0x10:0x30] == b"6e83e466a456e0b5ec3f546e785fa641"
+    assert packet[0x30:] == bytes.fromhex("000000080000000069000000")
 
 
 def test_xts_sdp_uses_dedicated_media_socket_like_android_client():

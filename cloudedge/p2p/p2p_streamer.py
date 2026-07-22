@@ -332,7 +332,10 @@ def build_vvp_packet(
     struct.pack_into(">I", pkt, 0x30, param)
     struct.pack_into("<I", pkt, 0x34, channel)
     pkt[0x38] = video_id & 0xFF
-    pkt[0x39] = 0x01
+    # The Android XTS client leaves the byte following the video id cleared.
+    # Some cameras accept 1 here, but stricter firmware acknowledges the KCP
+    # segment without accepting the VVP login command.
+    pkt[0x39] = 0x00
     pkt[0x3A] = quality & 0xFF
     pkt[0x3B] = 0x00
     return bytes(pkt)
