@@ -179,28 +179,35 @@ def _resolve_signaling_candidates(
         elif "australia/" in region or "asia/" in region or "pacific/" in region:
             add_region_host("usce.mearicloud.com")
 
-    openapi_host = urlparse(openapi_base).hostname or ""
-    if openapi_host.startswith("openapi-") and openapi_host.endswith(".mearicloud.com"):
-        add_region_host(openapi_host[len("openapi-") :])
+    # The signaling port is dynamic: the region hosts below use the legacy
+    # fixed port 28974, which is routinely refused/filtered nowadays. Each
+    # dead candidate burns ~8-10s per retry loop, so only fall back to the
+    # static list when dynamic discovery produced nothing.
+    if not discovered:
+        openapi_host = urlparse(openapi_base).hostname or ""
+        if openapi_host.startswith("openapi-") and openapi_host.endswith(
+            ".mearicloud.com"
+        ):
+            add_region_host(openapi_host[len("openapi-") :])
 
-    if (
-        isinstance(mqtt_host, str)
-        and mqtt_host.startswith("events-")
-        and mqtt_host.endswith(".mearicloud.com")
-    ):
-        add_region_host(mqtt_host[len("events-") :])
+        if (
+            isinstance(mqtt_host, str)
+            and mqtt_host.startswith("events-")
+            and mqtt_host.endswith(".mearicloud.com")
+        ):
+            add_region_host(mqtt_host[len("events-") :])
 
-    region_hosts = {
-        "eu": "euce.mearicloud.com",
-        "us": "usce.mearicloud.com",
-        "ap": "usce.mearicloud.com",
-    }
-    add_region_host(region_hosts.get(getattr(api, "region", ""), ""))
+        region_hosts = {
+            "eu": "euce.mearicloud.com",
+            "us": "usce.mearicloud.com",
+            "ap": "usce.mearicloud.com",
+        }
+        add_region_host(region_hosts.get(getattr(api, "region", ""), ""))
 
-    add_device_region_hosts()
+        add_device_region_hosts()
 
-    add_region_host("euce.mearicloud.com")
-    candidates.append(("47.254.142.96", 28974))
+        add_region_host("euce.mearicloud.com")
+        candidates.append(("47.254.142.96", 28974))
 
     unique_candidates: list[tuple[str, int]] = []
     seen: set[tuple[str, int]] = set()

@@ -465,7 +465,7 @@ def test_wake_dormant_device_waits_for_signaling_to_report_online_after_http_wak
     assert sig.query_calls == ["device-uuid", "device-uuid", "device-uuid"]
 
 
-def test_signaling_candidates_prefer_account_region_over_device_region(monkeypatch):
+def test_signaling_candidates_skip_static_hosts_when_discovery_works(monkeypatch):
     monkeypatch.setattr(
         "cloudedge.p2p.p2p_streamer.discover_msgsvr_endpoints",
         lambda **kwargs: [("198.51.100.20", 31001)],
@@ -483,9 +483,35 @@ def test_signaling_candidates_prefer_account_region_over_device_region(monkeypat
         },
     )
 
-    assert candidates[0] == ("198.51.100.20", 31001)
+    # Dynamic discovery worked: the legacy fixed-port 28974 hosts are dead
+    # weight (each costs ~10s of refused/timeout per retry loop) — skip them.
+    assert candidates == [("198.51.100.20", 31001)]
+
+
+def test_signaling_candidates_prefer_account_region_over_device_region(monkeypatch):
+    monkeypatch.setattr(
+        "cloudedge.p2p.p2p_streamer.discover_msgsvr_endpoints",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "cloudedge.p2p.p2p_streamer.socket.gethostbyname",
+        lambda host: {"euce.mearicloud.com": "47.254.142.96"}.get(host, "203.0.113.10"),
+    )
+
+    candidates = _resolve_signaling_candidates(
+        _RegionApi(),
+        {
+            "device_region": "Europe/Rome",
+            "device_icon_url": "https://meari-eu.oss-eu-central-1.aliyuncs.com/device.png",
+        },
+    )
+
+    # Discovery empty: static fallbacks kick in, account region (US) first.
     assert ("usce.mearicloud.com", 28974) in candidates
     assert ("euce.mearicloud.com", 28974) in candidates
+    assert candidates.index(("usce.mearicloud.com", 28974)) < candidates.index(
+        ("euce.mearicloud.com", 28974)
+    )
 
 
 def test_root_discovery_frame_round_trip():
