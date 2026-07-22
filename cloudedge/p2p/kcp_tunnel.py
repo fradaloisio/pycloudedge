@@ -38,7 +38,7 @@ KCP_CMD_WASK = 83   # 0x53 - window probe request
 KCP_CMD_WINS = 84   # 0x54 - window probe response
 KCP_HEADER_SIZE = 24
 KCP_MSS = 1176      # 0x498 - max segment size
-KCP_WND = 4096      # Advertised receive window (large to avoid flow control throttle)
+KCP_WND = 1024      # Receive window advertised by the official Android client
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -87,6 +87,8 @@ def parse_iva_frame(data):
     session_id2 = struct.unpack_from("<I", data, 0x08)[0]
     type_marker = struct.unpack_from("<H", data, 0x0E)[0]
     data_len = struct.unpack_from("<I", data, 0x10)[0]
+    if data_len > len(data) - IVA_FRAME_SIZE:
+        return None
     payload = data[IVA_FRAME_SIZE:IVA_FRAME_SIZE + data_len] if data_len > 0 else b""
     return type_marker, session_id1, session_id2, payload
 
@@ -107,25 +109,52 @@ def build_kcp_segment(cmd, sn=0, una=0, wnd=KCP_WND, ts=0, frg=0, data=b""):
 
 
 def parse_kcp_segment(raw):
-    """Parse a KCP segment. Returns dict or None."""
-    if len(raw) < KCP_HEADER_SIZE:
-        return None
-    conv, cmd, frg, wnd, ts, sn, una, length = struct.unpack_from(
-        "<IBBHIIII", raw, 0)
-    if conv != KCP_CONV:
-        return None
-    payload = raw[KCP_HEADER_SIZE:KCP_HEADER_SIZE + length]
-    return {
-        "conv": conv,
-        "cmd": cmd,
-        "frg": frg,
-        "wnd": wnd,
-        "ts": ts,
-        "sn": sn,
-        "una": una,
-        "len": length,
-        "data": payload,
-    }
+    """Parse the first segment in a valid KCP datagram."""
+    segments = parse_kcp_segments(raw)
+    return segments[0] if segments else None
+
+
+def parse_kcp_segments(raw):
+    """Parse every concatenated KCP segment in one UDP datagram.
+
+    KCP deliberately allows several segments to share a datagram. Reject the
+    whole datagram if any declared payload is truncated so partial media is
+    never passed to the frame parser.
+    """
+    segments = []
+    offset = 0
+
+    while offset < len(raw):
+        if len(raw) - offset < KCP_HEADER_SIZE:
+            return None
+
+        conv, cmd, frg, wnd, ts, sn, una, length = struct.unpack_from(
+            "<IBBHIIII", raw, offset
+        )
+        if conv != KCP_CONV:
+            return None
+
+        payload_start = offset + KCP_HEADER_SIZE
+        payload_end = payload_start + length
+        if payload_end > len(raw):
+            return None
+
+        segments.append(
+            {
+                "conv": conv,
+                "cmd": cmd,
+                "frg": frg,
+                "wnd": wnd,
+                "ts": ts,
+                "sn": sn,
+                "una": una,
+                "len": length,
+                "data": raw[payload_start:payload_end],
+            }
+        )
+        offset = payload_end
+
+    return segments or None
 
 
 class KcpTunnel:
@@ -175,6 +204,11 @@ class KcpTunnel:
 
         # Queue of fully reassembled messages ready for delivery
         self.recv_queue = []
+
+        # A persistent gap can split a fragmented KCP message. When the
+        # safety-net gap skip is used, discard through the next frg=0 boundary
+        # instead of delivering a truncated media frame.
+        self._discard_until_message_end = False
 
         # Deferred ACK queue: list of (sn, ts) to send in batch
         self.pending_acks = []
@@ -343,22 +377,16 @@ class KcpTunnel:
             new_sn = min(above)
             gap_size = new_sn - self.next_recv_sn
             total_gaps += gap_size
-            # Discard any partial fragment state (the missing segment
-            # was likely a fragment boundary, so existing fragments are stale)
+            # Both the partial message before the gap and the first message
+            # after it may be incomplete. Discard through the next frg=0
+            # boundary; _drain_receive_buffer keeps this state if the boundary
+            # has not arrived yet.
             self.recv_frag_buf = []
             self.next_recv_sn = new_sn
+            self._discard_until_message_end = True
             any_skipped = True
 
-            # Assemble contiguous segments after the gap
-            while self.next_recv_sn in self.recv_buf:
-                frg, data = self.recv_buf[self.next_recv_sn]
-                self.recv_frag_buf.append(data)
-                del self.recv_buf[self.next_recv_sn]
-                self.next_recv_sn += 1
-                if frg == 0:
-                    complete = b"".join(self.recv_frag_buf)
-                    self.recv_frag_buf = []
-                    self.recv_queue.append(complete)
+            self.recv_queue.extend(self._drain_receive_buffer())
 
             # If next_recv_sn is now in recv_buf (no gap), we're done
             if self.next_recv_sn in self.recv_buf or not self.recv_buf:
@@ -375,6 +403,88 @@ class KcpTunnel:
                 len(self.recv_queue),
             )
         return any_skipped
+
+    def _drain_receive_buffer(self):
+        """Assemble all contiguous receive segments into complete messages."""
+        messages = []
+        while self.next_recv_sn in self.recv_buf:
+            frg, data = self.recv_buf.pop(self.next_recv_sn)
+            self.next_recv_sn += 1
+
+            if self._discard_until_message_end:
+                if frg == 0:
+                    self._discard_until_message_end = False
+                continue
+
+            self.recv_frag_buf.append(data)
+            if frg == 0:
+                messages.append(b"".join(self.recv_frag_buf))
+                self.recv_frag_buf = []
+
+        return messages
+
+    def _process_kcp_segment(self, seg):
+        """Process one already validated KCP segment."""
+        cmd = seg["cmd"]
+
+        if cmd == KCP_CMD_PUSH:
+            if seg["sn"] >= self.una_recv:
+                self.una_recv = seg["sn"] + 1
+
+            sn = seg["sn"]
+            if self.next_recv_sn >= 0 and sn < self.next_recv_sn:
+                self.pending_acks.append((sn, seg["ts"]))
+                return ("dup", sn)
+
+            self.recv_buf[sn] = (seg["frg"], seg["data"])
+            if self.next_recv_sn < 0:
+                self.next_recv_sn = sn
+
+            messages = self._drain_receive_buffer()
+            self.pending_acks.append((sn, seg["ts"]))
+
+            if not messages:
+                return ("fragment", seg["data"])
+
+            for message in messages[1:]:
+                self.recv_queue.append(message)
+
+            data = messages[0]
+            if len(data) >= IVA_FRAME_SIZE and data.startswith(IVA_MAGIC):
+                iva = parse_iva_frame(data)
+                if not iva:
+                    return None
+                type_marker, id1, id2, payload = iva
+                if type_marker == IVA_TYPE_HANDSHAKE:
+                    self.handshake_done = True
+                    self.peer_id1 = id1
+                    self.peer_id2 = id2
+                    return ("handshake", (id1, id2))
+                if type_marker == IVA_TYPE_DATA:
+                    return ("data", payload)
+
+            return ("data", data)
+
+        if cmd == KCP_CMD_ACK:
+            self.acked_sns.add(seg["sn"])
+            self.sent_segments.pop(seg["sn"], None)
+            return ("ack", seg["sn"])
+
+        if cmd == KCP_CMD_WASK:
+            wins = build_kcp_segment(
+                cmd=KCP_CMD_WINS,
+                sn=self.sn_send,
+                una=max(self.next_recv_sn, 0),
+                wnd=KCP_WND,
+                ts=self._ts(),
+            )
+            self.send_func(wins)
+            return ("wask", None)
+
+        if cmd == KCP_CMD_WINS:
+            return ("wins", seg["wnd"])
+
+        return None
 
     def process_input(self, raw):
         """Process incoming UDP data.
@@ -403,98 +513,27 @@ class KcpTunnel:
                 return ("iva", payload)
             return None
 
-        # Check for KCP segment
-        seg = parse_kcp_segment(raw)
-        if not seg:
+        # A UDP datagram may contain multiple concatenated KCP segments.
+        segments = parse_kcp_segments(raw)
+        if not segments:
             return None
 
-        cmd = seg["cmd"]
+        primary_result = None
+        control_result = None
+        fragment_result = None
+        for seg in segments:
+            result = self._process_kcp_segment(seg)
+            if not result:
+                continue
+            kind = result[0]
+            if kind in ("data", "handshake"):
+                if primary_result is None:
+                    primary_result = result
+                elif kind == "data":
+                    self.recv_queue.append(result[1])
+            elif kind == "fragment":
+                fragment_result = result
+            elif control_result is None:
+                control_result = result
 
-        if cmd == KCP_CMD_PUSH:
-            # Update una_recv
-            if seg["sn"] >= self.una_recv:
-                self.una_recv = seg["sn"] + 1
-
-            # Store in receive buffer for ordered reassembly
-            sn = seg["sn"]
-
-            # Skip duplicate/retransmitted segments we've already processed
-            if self.next_recv_sn >= 0 and sn < self.next_recv_sn:
-                # Queue ACK with current cumulative una to help sender advance
-                self.pending_acks.append((seg["sn"], seg["ts"]))
-                return ("dup", sn)
-
-            self.recv_buf[sn] = (seg["frg"], seg["data"])
-
-            # Initialize next_recv_sn on first PUSH segment received
-            # (camera may start at sn=1 if sn=0 was used for IVA handshake)
-            if self.next_recv_sn < 0:
-                self.next_recv_sn = sn
-
-            # Try to assemble complete messages from recv_buf
-            # Process segments in order starting from next_recv_sn
-            messages = []
-            while self.next_recv_sn in self.recv_buf:
-                frg, data = self.recv_buf[self.next_recv_sn]
-                self.recv_frag_buf.append(data)
-                del self.recv_buf[self.next_recv_sn]
-                self.next_recv_sn += 1
-
-                if frg == 0:
-                    # Last fragment - assemble complete message
-                    complete = b"".join(self.recv_frag_buf)
-                    self.recv_frag_buf = []
-                    messages.append(complete)
-
-            # Queue ACK for batched sending (flush_acks() sends all at once)
-            self.pending_acks.append((seg["sn"], seg["ts"]))
-
-            if not messages:
-                # No complete message yet - still accumulating fragments
-                return ("fragment", seg["data"])
-
-            # Process the first complete message
-            # (additional messages queued for later retrieval)
-            for msg in messages[1:]:
-                self.recv_queue.append(msg)
-
-            data = messages[0]
-
-            # Auto-detect IVA frame inside reassembled KCP payload
-            if len(data) >= 20 and data[0] == 0xFF and data[1] == 0x01:
-                iva = parse_iva_frame(data)
-                if iva:
-                    type_marker, id1, id2, payload = iva
-                    if type_marker == IVA_TYPE_HANDSHAKE:
-                        self.handshake_done = True
-                        self.peer_id1 = id1
-                        self.peer_id2 = id2
-                        return ("handshake", (id1, id2))
-                    if type_marker == IVA_TYPE_DATA:
-                        return ("data", payload)
-
-            return ("data", data)
-
-        elif cmd == KCP_CMD_ACK:
-            self.acked_sns.add(seg["sn"])
-            # Clean up sent_segments for ACK'd data
-            if seg["sn"] in self.sent_segments:
-                del self.sent_segments[seg["sn"]]
-            return ("ack", seg["sn"])
-
-        elif cmd == KCP_CMD_WASK:
-            # Window probe request - respond with WINS
-            wins = build_kcp_segment(
-                cmd=KCP_CMD_WINS,
-                sn=self.sn_send,
-                una=max(self.next_recv_sn, 0),
-                wnd=KCP_WND,
-                ts=self._ts(),
-            )
-            self.send_func(wins)
-            return ("wask", None)
-
-        elif cmd == KCP_CMD_WINS:
-            return ("wins", seg["wnd"])
-
-        return None
+        return primary_result or control_result or fragment_result
