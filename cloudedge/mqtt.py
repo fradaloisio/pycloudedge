@@ -76,6 +76,9 @@ class CloudEdgeMqttListener:
         on_motion: Callback invoked only for motion-related events.
         on_connect: Called when the MQTT connection is established.
         on_disconnect: Called when the MQTT connection drops.
+        verify_tls: Verify the broker's TLS certificate (default ``True``).
+            Only set ``False`` if your regional broker presents an
+            unverifiable certificate — this exposes the connection to MITM.
     """
 
     def __init__(
@@ -86,6 +89,7 @@ class CloudEdgeMqttListener:
         on_motion: Optional[OnEventCallback] = None,
         on_connect: Optional[Callable[[], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
+        verify_tls: bool = True,
     ) -> None:
         mqtt_cfg = client.get_mqtt_config()
         if not mqtt_cfg:
@@ -109,6 +113,7 @@ class CloudEdgeMqttListener:
 
         self._client: Any = None
         self._connected = False
+        self._verify_tls = verify_tls
 
     @property
     def connected(self) -> bool:
@@ -173,10 +178,7 @@ class CloudEdgeMqttListener:
 
         client.username_pw_set(self._username, self._password)
 
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-        client.tls_set_context(ssl_ctx)
+        client.tls_set_context(self._build_ssl_context())
 
         client.on_connect = _on_connect
         client.on_disconnect = _on_disconnect
@@ -193,6 +195,26 @@ class CloudEdgeMqttListener:
             _LOGGER.error("MQTT connection failed: %s", exc)
             self._connected = False
             return False
+
+    def _build_ssl_context(self) -> ssl.SSLContext:
+        """Return the TLS context for the broker connection.
+
+        Certificate verification is ON by default: the broker credentials
+        travel over this connection and unverified TLS allows MITM. If a
+        regional broker really presents an unverifiable certificate,
+        construct the listener with ``verify_tls=False`` (a warning is
+        logged); there is no silent automatic downgrade.
+        """
+        ctx = ssl.create_default_context()
+        if not self._verify_tls:
+            _LOGGER.warning(
+                "MQTT TLS certificate verification DISABLED for %s:%s — "
+                "connection is exposed to man-in-the-middle attacks",
+                self._host, self._port,
+            )
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
 
     def stop(self) -> None:
         """Stop the MQTT background loop and disconnect."""
