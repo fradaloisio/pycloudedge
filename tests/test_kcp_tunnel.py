@@ -7,12 +7,21 @@ from cloudedge.p2p.kcp_tunnel import (
     KCP_HEADER_SIZE,
     KCP_WND,
     KcpTunnel,
+    build_iva_handshake,
     build_iva_data_frame,
     build_kcp_segment,
     parse_iva_frame,
     parse_kcp_segment,
     parse_kcp_segments,
 )
+
+
+def test_iva_handshake_matches_android_xts_capture():
+    frame = build_iva_handshake(0x070E8A6E, 0x06E9AFF6)
+
+    assert frame == bytes.fromhex(
+        "ff0100006e8a0e07f6afe9060003127000000000"
+    )
 
 
 def test_parse_kcp_segments_reads_compound_udp_datagram():

@@ -49,7 +49,13 @@ IVA_TYPE_HANDSHAKE = 0x7012
 IVA_TYPE_DATA = 0x7010
 
 
-def _build_iva_frame(type_marker, data, session_id1=None, session_id2=None):
+def _build_iva_frame(
+    type_marker,
+    data,
+    session_id1=None,
+    session_id2=None,
+    flags=0,
+):
     """Build an IVA frame with given type and optional data.
 
     The session IDs (at offsets 4 and 8) must be consistent within a session.
@@ -61,7 +67,7 @@ def _build_iva_frame(type_marker, data, session_id1=None, session_id2=None):
     header = struct.pack("<BBHI I HH I",
         0xFF, 0x01, 0, session_id1,
         session_id2,
-        0, type_marker,
+        flags, type_marker,
         len(data),
     )
     return header + data
@@ -74,7 +80,16 @@ def build_iva_data_frame(data, session_id1=None, session_id2=None):
 
 def build_iva_handshake(session_id1=None, session_id2=None):
     """Build a 20-byte IVA handshake frame."""
-    return _build_iva_frame(IVA_TYPE_HANDSHAKE, b"", session_id1, session_id2)
+    # The Android XTS client sets bits 8 and 9 only on the opening 0x7012
+    # frame. Some cameras tolerate zero here, while protocol-v6 devices do not
+    # advance the IVA session even though they ACK the enclosing KCP segment.
+    return _build_iva_frame(
+        IVA_TYPE_HANDSHAKE,
+        b"",
+        session_id1,
+        session_id2,
+        flags=0x0300,
+    )
 
 
 def parse_iva_frame(data):
