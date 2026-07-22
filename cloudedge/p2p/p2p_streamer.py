@@ -120,6 +120,25 @@ def _is_direct_peer_path(
     return not remote and not via_turn and peer_ip != turn_server_ip
 
 
+def _send_kcp_datagram(
+    turn: TurnClient,
+    data: bytes,
+    *,
+    target_addr: tuple[str, int],
+    confirmed_peer: tuple[str, int, bool] | None,
+) -> None:
+    """Send KCP on the Android-compatible bootstrap or confirmed media path."""
+    if confirmed_peer is None:
+        turn.send_to_peer(*target_addr, data)
+        return
+
+    peer_ip, peer_port, is_direct = confirmed_peer
+    if is_direct:
+        turn.peer_sock.sendto(data, (peer_ip, peer_port))
+    else:
+        turn.send_to_peer(peer_ip, peer_port, data)
+
+
 def _build_xts_sdp_offer(
     *,
     ice_ufrag: str,
@@ -1006,34 +1025,20 @@ class P2PStreamer:
         direct_send_addrs: set[tuple[str, int]] = set()
 
         def _udp_send(data):
-            if confirmed_peer[0]:
-                cp_ip, cp_port, is_direct = confirmed_peer[0]
-                if is_direct:
-                    try:
-                        turn.peer_sock.sendto(data, (cp_ip, cp_port))
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        turn.send_to_peer(cp_ip, cp_port, data)
-                    except Exception:
-                        pass
-                return
-            sent_to: set = set()
-            for c in camera_candidates:
-                key = (c["ip"], c["port"])
-                if key in sent_to:
-                    continue
-                sent_to.add(key)
-                try:
-                    turn.send_to_peer(c["ip"], c["port"], data)
-                except Exception:
-                    pass
-            for direct_send_addr in tuple(direct_send_addrs):
-                try:
-                    turn.peer_sock.sendto(data, direct_send_addr)
-                except Exception:
-                    pass
+            # Match the Android SDK bootstrap: send IVA/KCP through the single
+            # negotiated TURN candidate until the camera answers with KCP.  ICE
+            # checks still probe every candidate, but duplicating the same KCP
+            # sequence number over host, srflx and relay paths can make stricter
+            # cameras ACK the handshake and then discard the VVP login.
+            try:
+                _send_kcp_datagram(
+                    turn,
+                    data,
+                    target_addr=(target_ip, target_port),
+                    confirmed_peer=confirmed_peer[0],
+                )
+            except Exception:
+                pass
 
         kcp = KcpTunnel(_udp_send)
 
@@ -1459,7 +1464,7 @@ class P2PStreamer:
                 "ice_events=%s ice_confirmed=%s iva_handshake=%s "
                 "kcp_pushes=%s kcp_acks=%s kcp_unacked=%s "
                 "last_kcp_age=%s confirmed_peer=%s direct_peer=%s "
-                "direct_send_addrs=%s",
+                "direct_send_addrs=%s kcp_acked_sns=%s",
                 self._video_id,
                 candidate_summary,
                 target_ip,
@@ -1474,6 +1479,7 @@ class P2PStreamer:
                 confirmed_peer[0],
                 direct_addr,
                 sorted(direct_send_addrs),
+                sorted(kcp.acked_sns),
             )
             return (stream_video_count, stream_total_bytes)
 

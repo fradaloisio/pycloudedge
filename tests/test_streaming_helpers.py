@@ -14,6 +14,7 @@ from cloudedge.p2p.p2p_streamer import (
     _build_ice_response,
     _build_xts_sdp_offer,
     _is_direct_peer_path,
+    _send_kcp_datagram,
     _resolve_signaling_candidates,
     build_vvp_packet,
     parse_stream_frame,
@@ -195,6 +196,64 @@ def test_relayed_or_forced_remote_peer_is_not_direct():
         peer_ip="18.133.62.87",
         turn_server_ip="18.133.62.87",
     )
+
+
+def test_kcp_bootstrap_uses_only_negotiated_turn_candidate():
+    class FakePeerSocket:
+        def __init__(self):
+            self.sent = []
+
+        def sendto(self, data, address):
+            self.sent.append((data, address))
+
+    class FakeTurn:
+        def __init__(self):
+            self.relayed = []
+            self.peer_sock = FakePeerSocket()
+
+        def send_to_peer(self, ip, port, data):
+            self.relayed.append((ip, port, data))
+
+    turn = FakeTurn()
+    _send_kcp_datagram(
+        turn,
+        b"login",
+        target_addr=("172.236.11.156", 22246),
+        confirmed_peer=None,
+    )
+
+    assert turn.relayed == [("172.236.11.156", 22246, b"login")]
+    assert turn.peer_sock.sent == []
+
+
+def test_kcp_switches_to_confirmed_direct_media_path():
+    class FakePeerSocket:
+        def __init__(self):
+            self.sent = []
+
+        def sendto(self, data, address):
+            self.sent.append((data, address))
+
+    class FakeTurn:
+        def __init__(self):
+            self.relayed = []
+            self.peer_sock = FakePeerSocket()
+
+        def send_to_peer(self, ip, port, data):
+            self.relayed.append((ip, port, data))
+
+    turn = FakeTurn()
+    _send_kcp_datagram(
+        turn,
+        b"heartbeat",
+        target_addr=("172.236.11.156", 22246),
+        confirmed_peer=("192.168.1.125", 56722, True),
+    )
+
+    assert turn.relayed == []
+    assert turn.peer_sock.sent == [
+        (b"heartbeat", ("192.168.1.125", 56722))
+    ]
 
 
 class _RunSessionApi:
