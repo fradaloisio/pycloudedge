@@ -1347,6 +1347,11 @@ class P2PStreamer:
                         if not remote and addr[0] != coturn_ip:
                             direct_send_addrs.add(addr)
                             direct_addr = addr
+                            # ICE nomination is enough to select the media
+                            # path. Waiting for an inbound KCP PUSH creates a
+                            # deadlock on cameras that only answer KCP after
+                            # the client retransmits its bootstrap directly.
+                            confirmed_peer[0] = (addr[0], addr[1], True)
                             kcp.retransmit_unacked()
                         continue
                     else:
@@ -1360,7 +1365,7 @@ class P2PStreamer:
                 if kcp_seg["cmd"] == 81:
                     kcp_push_count += 1
                     last_kcp_data_time = time.time()
-                    if not confirmed_peer[0] and source_addr:
+                    if source_addr:
                         cp_ip, cp_port = source_addr
                         is_direct = _is_direct_peer_path(
                             remote=remote,
