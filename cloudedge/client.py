@@ -37,7 +37,7 @@ from .iot_parameters import (
 )
 from .constants import (
     CA_KEY, CA_SECRET, DEFAULT_HEADERS, DEFAULT_TIMEOUT,
-    REDIRECT_URL,
+    REDIRECT_URL, SESSION_INVALID_RESULT_CODES,
 )
 from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
@@ -733,19 +733,25 @@ class CloudEdgeClient:
         except Exception as exc:
             raise NetworkError(f"Endpoint discovery failed: {exc}") from exc
 
-    def authenticate(self) -> bool:
+    def authenticate(self, force_refresh: bool = False) -> bool:
         """
         Authenticate with CloudEdge API.
-        
+
+        Args:
+            force_refresh: Skip the cached session and perform a fresh
+                login. Use after the server rejected the cached token
+                (e.g. another device logged into the account): the cache
+                file on disk still looks valid but the session is dead.
+
         Returns:
             bool: True if authentication successful, False otherwise
-            
+
         Raises:
             AuthenticationError: If authentication fails
             NetworkError: If network request fails
         """
         # Try to load cached session first
-        self.session_data = self._load_session_cache()
+        self.session_data = None if force_refresh else self._load_session_cache()
         if self.session_data:
             self._log("Using cached session")
             # Restore discovered endpoints from cache if present
@@ -1125,6 +1131,14 @@ class CloudEdgeClient:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
                 self._log(f"API error - Code: {error_code}, Message: {error_msg}, Full response: {response_data}")
+                if str(error_code) in SESSION_INVALID_RESULT_CODES:
+                    # The server rejected our token (e.g. the account was
+                    # logged in elsewhere — one active session per account).
+                    # Raise the typed auth error so callers re-authenticate
+                    # instead of retrying forever with a dead session.
+                    raise AuthenticationError(
+                        f"Session rejected by API (Code: {error_code}): {error_msg}"
+                    )
                 raise CloudEdgeError(
                     f"Failed to retrieve homes: {error_msg} (Code: {error_code})",
                     details={"error_code": error_code, "message": error_msg, "response": response_data}

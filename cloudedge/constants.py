@@ -31,5 +31,11 @@ DEFAULT_LANGUAGE = "en"
 DEFAULT_TIMEOUT = 30
 PING_TIMEOUT = 2.0
 
+# API result codes that mean the session token was rejected by the server
+# (e.g. the account logged in elsewhere — one active session per account).
+# 1023 observed empirically: valid-looking cached token -> homes API 1023;
+# fresh login -> works.
+SESSION_INVALID_RESULT_CODES = {"1023"}
+
 # Cache settings
 DEFAULT_CACHE_FILE = ".cloudedge_session_cache"
