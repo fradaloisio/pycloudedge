@@ -22,6 +22,13 @@ from .exceptions import (
     ConfigurationError, NetworkError, ValidationError, RateLimitError
 )
 from .iot_parameters import IOT_PARAMETERS, get_parameter_name, format_parameter_value
+from .stream_profiles import (
+    get_available_live_stream_ids,
+    get_live_stream_profiles,
+    select_default_live_stream_id,
+    select_live_stream_id,
+    supports_adaptive_live_stream,
+)
 
 try:
     from ._version import version as __version__
@@ -50,4 +57,9 @@ __all__ = [
     'decrypt_jpgx3',
     'decrypt_jpgx3_from_url',
     'verify_licence_for_url',
+    'get_available_live_stream_ids',
+    'get_live_stream_profiles',
+    'select_default_live_stream_id',
+    'select_live_stream_id',
+    'supports_adaptive_live_stream',
 ]

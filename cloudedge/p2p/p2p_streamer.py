@@ -47,6 +47,7 @@ from .turn_client import (
 )
 from .kcp_tunnel import KcpTunnel, parse_kcp_segment, parse_iva_frame
 from ..client import CloudEdgeClient
+from ..stream_profiles import select_default_live_stream_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -406,7 +407,7 @@ class P2PStreamer:
         on_login: Callable[[], None] | None = None,
         on_disconnect: Callable[[], None] | None = None,
         remote: bool = False,
-        video_id: int = 0,
+        video_id: int | None = None,
         manage_stream_switch: bool = True,
     ) -> None:
         self._api = api
@@ -421,6 +422,9 @@ class P2PStreamer:
         self.on_login = on_login
         self.on_disconnect = on_disconnect
         self._remote = remote
+        self._video_id_auto = video_id is None
+        if video_id is None:
+            video_id = select_default_live_stream_id(device)
         if not 0 <= video_id <= 0xFF:
             raise ValueError("video_id must be between 0 and 255")
         self._video_id = video_id
@@ -505,6 +509,8 @@ class P2PStreamer:
                     self._device.get("device_uuid") or format_sn(self._sn_num)
                 )
                 self._host_key = self._device.get("host_key", self._host_key)
+                if self._video_id_auto:
+                    self._video_id = select_default_live_stream_id(self._device)
 
             set_config = getattr(self._api, "set_device_config", None)
             if self._manage_stream_switch and callable(set_config) and self._sn_num:

@@ -41,6 +41,7 @@ from .constants import (
 )
 from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
+from .stream_profiles import extract_stream_capabilities
 from .utils import retry_on_failure
 
 # Device online status values returned by get_device_online_status()
@@ -76,6 +77,7 @@ def _extract_app_streaming_metadata(device: Dict[str, Any]) -> Dict[str, Any]:
         value = device.get(source_key)
         if value not in (None, ""):
             metadata[normalized_key] = value
+    metadata.update(extract_stream_capabilities(device))
     return metadata
 
 
@@ -226,7 +228,7 @@ class CloudEdgeClient:
         on_login=None,
         on_disconnect=None,
         remote: bool = False,
-        video_id: int = 0,
+        video_id: Optional[int] = None,
         manage_stream_switch: bool = True,
     ):
         """Create a native P2P streamer for a CloudEdge camera device."""
