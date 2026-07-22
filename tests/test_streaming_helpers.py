@@ -1,7 +1,19 @@
+import struct
+
 import pytest
 
 from cloudedge.client import CloudEdgeClient, DEVICE_STATUS_DORMANCY
-from cloudedge.p2p.p2p_streamer import P2PStreamer, _resolve_signaling_candidates
+from cloudedge.p2p.p2p_streamer import (
+    P2PStreamer,
+    STREAM_TYPE_AUDIO,
+    STREAM_TYPE_IFRAME,
+    STREAM_TYPE_INFO,
+    STREAM_TYPE_PFRAME,
+    VVP_CMD_START_LIVE,
+    VVP_CMD_STOP,
+    _resolve_signaling_candidates,
+    parse_stream_frame,
+)
 from cloudedge.p2p.root_discovery import (
     _build_discovery_frame,
     _parse_discovery_frame,
@@ -82,6 +94,55 @@ class _DummyApi:
 class _DummySig:
     def query_device_status(self, device_uuid):
         raise AssertionError("signaling retry should not run for dormancy")
+
+
+class _RecordingKcp:
+    def __init__(self):
+        self.payloads = []
+
+    def send_iva_data(self, payload):
+        self.payloads.append(payload)
+
+
+class _LifecycleApi:
+    session_data = {"userID": "123"}
+    country_code = "IT"
+
+
+class _LifecycleSig:
+    def register(self, **kwargs):
+        return {}
+
+    def webrtc_hello_full(self):
+        return None
+
+    def query_device_status(self, device_uuid):
+        return {"status": "online", "contact": {}, "nat": {}}
+
+    def request_coturn(self, device_uuid):
+        return {
+            "coturn_ip": "192.0.2.1",
+            "coturn_port": 9100,
+            "username": "user",
+            "pwd": "password",
+        }
+
+
+class _LifecycleTurn:
+    instances = []
+
+    def __init__(self, *args):
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def connect(self):
+        return None
+
+    def allocate(self):
+        return True
+
+    def close(self):
+        self.closed = True
 
 
 class _NoContactWakeApi:
@@ -228,6 +289,100 @@ def test_streamer_rejects_invalid_video_id():
             },
             video_id=256,
         )
+
+
+def test_active_vvp_restart_uses_observed_stop_and_start_commands():
+    streamer = P2PStreamer(
+        api=_DummyApi(DEVICE_STATUS_DORMANCY),
+        device={
+            "serial_number": "ppsl123",
+            "host_key": "0123456789abcdef0123456789abcdef",
+            "name": "Camera",
+        },
+        video_id=102,
+    )
+    kcp = _RecordingKcp()
+    streamer._active_vvp_session = {
+        "kcp": kcp,
+        "host_key": streamer._host_key,
+        "licence_id": "licence-id",
+        "video_id": 102,
+        "next_sequence": 7,
+    }
+
+    assert streamer._restart_active_vvp_stream() is True
+
+    assert [struct.unpack_from(">I", packet, 0x0C)[0] for packet in kcp.payloads] == [
+        VVP_CMD_STOP,
+        VVP_CMD_START_LIVE,
+    ]
+    assert [struct.unpack_from(">I", packet, 0x08)[0] for packet in kcp.payloads] == [
+        7,
+        8,
+    ]
+    assert [packet[0x38] for packet in kcp.payloads] == [102, 102]
+    assert streamer._active_vvp_session["next_sequence"] == 9
+
+
+def test_do_stream_sends_stop_before_closing_turn_on_failure(monkeypatch):
+    _LifecycleTurn.instances = []
+    kcp = _RecordingKcp()
+    streamer = P2PStreamer(
+        api=_LifecycleApi(),
+        device={
+            "serial_number": "ppsl123",
+            "device_uuid": "device-uuid",
+            "host_key": "0123456789abcdef0123456789abcdef",
+            "name": "Camera",
+        },
+    )
+    streamer._running = True
+
+    monkeypatch.setattr(
+        "cloudedge.p2p.p2p_streamer.TurnClient",
+        _LifecycleTurn,
+    )
+
+    def fail_after_vvp_start(self, *args):
+        self._active_vvp_session = {
+            "kcp": kcp,
+            "host_key": self._host_key,
+            "licence_id": "licence-id",
+            "video_id": 100,
+            "next_sequence": 3,
+        }
+        raise RuntimeError("stream failure")
+
+    monkeypatch.setattr(P2PStreamer, "_stream_with_turn", fail_after_vvp_start)
+
+    with pytest.raises(RuntimeError, match="stream failure"):
+        streamer._do_stream(_LifecycleSig())
+
+    assert struct.unpack_from(">I", kcp.payloads[0], 0x0C)[0] == VVP_CMD_STOP
+    assert _LifecycleTurn.instances[0].closed is True
+    assert streamer._active_vvp_session is None
+
+
+@pytest.mark.parametrize(
+    ("frame_type", "header_size", "length_offset", "length_format"),
+    [
+        (STREAM_TYPE_IFRAME, 0x3C, 0x38, "<I"),
+        (STREAM_TYPE_PFRAME, 0x34, 0x30, "<I"),
+        (STREAM_TYPE_AUDIO, 0x34, 0x30, "<I"),
+        (STREAM_TYPE_INFO, 8, 6, "<H"),
+    ],
+)
+def test_stream_frame_parser_rejects_truncated_declared_payload(
+    frame_type,
+    header_size,
+    length_offset,
+    length_format,
+):
+    frame = bytearray(header_size + 2)
+    frame[:4] = bytes((0, 0, 1, frame_type))
+    struct.pack_into(length_format, frame, length_offset, 100)
+
+    assert parse_stream_frame(bytes(frame)) is None
 
 
 def test_refresh_streaming_metadata_uses_current_account_device_values(monkeypatch):

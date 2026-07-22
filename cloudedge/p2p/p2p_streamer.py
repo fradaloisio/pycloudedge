@@ -55,7 +55,7 @@ _LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 VVP_MAGIC = 0x56565099
 VVP_CMD_START_LIVE = 0x11FF
-VVP_CMD_STOP = 0x0001
+VVP_CMD_STOP = 0x12FF
 VVP_CMD_HEARTBEAT = 0x888E
 VVP_HEADER_SIZE = 60
 
@@ -71,11 +71,12 @@ STREAM_ENCRYPT_KEY = b"!mearicloud2.0!"
 _SIGNAL_STATUS_RETRY_WINDOW = 20.0
 _SIGNAL_STATUS_RETRY_POLL = 1.0
 _KCP_GAP_NUDGE_DELAY = 0.2
-_KCP_GAP_SKIP_DELAY = 2.0
-# After this many seconds without a video frame, end the P2P session so the
-# caller can re-establish a fresh live window (the camera's live grant is finite
-# and START_LIVE reissue does not revive a stalled stream).
-_VIDEO_STALL_END_SESSION = 6.0
+_KCP_GAP_SKIP_DELAY = 5.0
+_VIDEO_STALL_RESTART_DELAY = 8.0
+_VIDEO_STALL_RESTART_INTERVAL = 10.0
+# The Android client keeps the P2P session alive across observed 15-33 second
+# pauses. Allow the same recovery window before falling back to a reconnect.
+_VIDEO_STALL_END_SESSION = 35.0
 
 
 # ---------------------------------------------------------------------------
@@ -310,24 +311,32 @@ def parse_stream_frame(data: bytes):
         if len(data) < 0x3C:
             return None
         data_len = struct.unpack_from("<I", data, 0x38)[0]
+        if data_len > len(data) - 0x3C:
+            return None
         payload = data[0x3C : 0x3C + data_len] if data_len > 0 else data[0x3C:]
         return (frame_type, 0x3C, payload)
     elif frame_type == STREAM_TYPE_PFRAME:
         if len(data) < 0x34:
             return None
         data_len = struct.unpack_from("<I", data, 0x30)[0]
+        if data_len > len(data) - 0x34:
+            return None
         payload = data[0x34 : 0x34 + data_len] if data_len > 0 else data[0x34:]
         return (frame_type, 0x34, payload)
     elif frame_type == STREAM_TYPE_AUDIO:
         if len(data) < 0x34:
             return None
         data_len = struct.unpack_from("<I", data, 0x30)[0]
+        if data_len > len(data) - 0x34:
+            return None
         payload = data[0x34 : 0x34 + data_len] if data_len > 0 else data[0x34:]
         return (frame_type, 0x34, payload)
     elif frame_type == STREAM_TYPE_INFO:
         if len(data) < 8:
             return None
         data_len = struct.unpack_from("<H", data, 6)[0]
+        if data_len > len(data) - 8:
+            return None
         payload = data[8 : 8 + data_len] if data_len > 0 else data[8:]
         return (frame_type, 8, payload)
     return None
@@ -422,6 +431,7 @@ class P2PStreamer:
         self._total_bytes = 0
         self._cloudedge_native_signaling_retry = True
         self._cloudedge_native_region_signaling = True
+        self._active_vvp_session: dict[str, Any] | None = None
 
     def _get_vvp_licence_id(self) -> str | None:
         return self._device.get("relay_license_id") or (
@@ -431,6 +441,38 @@ class P2PStreamer:
     def request_stop(self) -> None:
         """Request the streaming loop to stop (thread-safe)."""
         self._running = False
+
+    def _remember_vvp_sequence(self, next_sequence: int) -> None:
+        if self._active_vvp_session is not None:
+            self._active_vvp_session["next_sequence"] = next_sequence
+
+    def _send_active_vvp_command(self, command: int) -> bool:
+        """Send a VVP command on the current KCP session, if one exists."""
+        session = self._active_vvp_session
+        if not session:
+            return False
+        sequence = session["next_sequence"]
+        packet = build_vvp_packet(
+            cmd=command,
+            seq=sequence,
+            host_key=session["host_key"],
+            param=8,
+            video_id=session["video_id"],
+            licence_id=session["licence_id"],
+        )
+        try:
+            session["kcp"].send_iva_data(packet)
+        except Exception as exc:
+            _LOGGER.debug("Could not send VVP command 0x%04x: %s", command, exc)
+            return False
+        session["next_sequence"] = sequence + 1
+        return True
+
+    def _restart_active_vvp_stream(self) -> bool:
+        """Restart live delivery without tearing down ICE, TURN, or KCP."""
+        stopped = self._send_active_vvp_command(VVP_CMD_STOP)
+        started = self._send_active_vvp_command(VVP_CMD_START_LIVE)
+        return stopped and started
 
     @property
     def video_count(self) -> int:
@@ -695,6 +737,7 @@ class P2PStreamer:
             turn.close()
             return (0, 0)
 
+        self._active_vvp_session = None
         try:
             return self._stream_with_turn(
                 sig,
@@ -707,6 +750,8 @@ class P2PStreamer:
                 remote,
             )
         finally:
+            self._send_active_vvp_command(VVP_CMD_STOP)
+            self._active_vvp_session = None
             turn.close()
 
     def _stream_with_turn(
@@ -971,6 +1016,13 @@ class P2PStreamer:
         vvp_seq += 1
         kcp.send_handshake()
         kcp.send_iva_data(vvp_login)
+        self._active_vvp_session = {
+            "kcp": kcp,
+            "host_key": host_key,
+            "licence_id": licence_id,
+            "video_id": self._video_id,
+            "next_sequence": vvp_seq,
+        }
 
         # State
         ice_deadline = time.time() + 30
@@ -997,6 +1049,7 @@ class P2PStreamer:
         last_kcp_data_time = None
         last_nudge_time = 0.0
         last_skip_time = 0.0
+        last_stream_restart_time = 0.0
         kcp_push_count = 0
 
         def _handle_stream_payload(payload):
@@ -1053,11 +1106,6 @@ class P2PStreamer:
         while self._running and time.time() < ice_deadline:
             now = time.time()
 
-            # End the session on a sustained video stall even though KCP/heartbeat
-            # traffic keeps the channel (and ice_deadline) alive. The camera grants
-            # a finite ~15-19s live window then stops video while keeping the
-            # channel up; without this the session never returns and the caller
-            # cannot re-establish a fresh window.
             if (
                 login_ok
                 and last_video_time
@@ -1070,6 +1118,21 @@ class P2PStreamer:
                 )
                 break
 
+            if (
+                login_ok
+                and last_video_time
+                and now - last_video_time > _VIDEO_STALL_RESTART_DELAY
+                and now - last_stream_restart_time > _VIDEO_STALL_RESTART_INTERVAL
+            ):
+                restarted = self._restart_active_vvp_stream()
+                if self._active_vvp_session is not None:
+                    vvp_seq = self._active_vvp_session["next_sequence"]
+                if restarted:
+                    last_stream_restart_time = now
+                    _LOGGER.info(
+                        "Restarted stalled live stream in the existing P2P session"
+                    )
+
             # Heartbeats
             if login_ok and now >= heartbeat_at:
                 hb = build_vvp_packet(
@@ -1081,6 +1144,7 @@ class P2PStreamer:
                 )
                 kcp.send_iva_data(hb)
                 vvp_seq += 1
+                self._remember_vvp_sequence(vvp_seq)
                 heartbeat_at = now + 10
 
             if login_ok and now >= iva_heartbeat_at:
@@ -1286,6 +1350,7 @@ class P2PStreamer:
                                 )
                                 kcp.send_iva_data(hb)
                                 vvp_seq += 1
+                                self._remember_vvp_sequence(vvp_seq)
                             ice_deadline = max(ice_deadline, time.time() + 30)
                             _handle_stream_payload(payload)
                         _drain_kcp_queue()
@@ -1331,7 +1396,10 @@ class P2PStreamer:
             _LOGGER.warning("VVP login failed")
             return (stream_video_count, stream_total_bytes)
 
-        if last_video_time and time.time() - last_video_time > 10:
+        if (
+            last_video_time
+            and time.time() - last_video_time > _VIDEO_STALL_END_SESSION
+        ):
             return (stream_video_count, stream_total_bytes)
 
         # Continuation receiver
@@ -1376,6 +1444,7 @@ class P2PStreamer:
         last_kcp_data_time = time.time()
         last_nudge_time = 0.0
         last_skip_time = 0.0
+        last_stream_restart_time = 0.0
         vvp_seq = vvp_seq_start
         last_heartbeat = time.time()
         last_iva_heartbeat = time.time()
@@ -1438,6 +1507,7 @@ class P2PStreamer:
             )
             kcp.send_iva_data(hb)
             vvp_seq += 1
+            self._remember_vvp_sequence(vvp_seq)
 
         _recv_buf: deque = deque()
         timeout_count = 0
@@ -1471,6 +1541,7 @@ class P2PStreamer:
                         )
                         kcp.send_iva_data(hb)
                         vvp_seq += 1
+                        self._remember_vvp_sequence(vvp_seq)
                         last_heartbeat = now
                     if now - last_iva_heartbeat >= 3:
                         kcp.send_handshake()
@@ -1492,11 +1563,6 @@ class P2PStreamer:
                     if last_kcp_data_time and now - last_kcp_data_time > 20:
                         _LOGGER.debug("No KCP data for 20s, ending session")
                         break
-                    # The camera grants a finite live window (~15-20s) after
-                    # which it stops sending video even though heartbeats keep
-                    # the channel alive. START_LIVE reissue does not revive it,
-                    # so end the session promptly on a sustained video stall and
-                    # let the caller re-establish a fresh window.
                     if (
                         last_video_time
                         and now - last_video_time > _VIDEO_STALL_END_SESSION
@@ -1507,6 +1573,21 @@ class P2PStreamer:
                             now - last_video_time,
                         )
                         break
+                    if (
+                        last_video_time
+                        and now - last_video_time > _VIDEO_STALL_RESTART_DELAY
+                        and now - last_stream_restart_time
+                        > _VIDEO_STALL_RESTART_INTERVAL
+                    ):
+                        restarted = self._restart_active_vvp_stream()
+                        if self._active_vvp_session is not None:
+                            vvp_seq = self._active_vvp_session["next_sequence"]
+                        if restarted:
+                            last_stream_restart_time = now
+                            _LOGGER.info(
+                                "Restarted stalled live stream in the existing "
+                                "P2P session"
+                            )
                     if last_video_time and now - last_video_time > _KCP_GAP_NUDGE_DELAY:
                         if now - last_nudge_time > _KCP_GAP_NUDGE_DELAY:
                             kcp.send_gap_nudge()
@@ -1632,6 +1713,7 @@ class P2PStreamer:
                 )
                 kcp.send_iva_data(hb)
                 vvp_seq += 1
+                self._remember_vvp_sequence(vvp_seq)
                 last_heartbeat = now
             if now - last_iva_heartbeat >= 3:
                 kcp.send_handshake()
