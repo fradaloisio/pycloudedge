@@ -11,9 +11,24 @@ from cloudedge.p2p.p2p_streamer import (
     STREAM_TYPE_PFRAME,
     VVP_CMD_START_LIVE,
     VVP_CMD_STOP,
+    _build_ice_response,
     _is_direct_peer_path,
     _resolve_signaling_candidates,
     parse_stream_frame,
+)
+from cloudedge.p2p.turn_client import (
+    ATTR_ICE_CONTROLLING,
+    ATTR_MESSAGE_INTEGRITY,
+    ATTR_PRIORITY,
+    ATTR_SOFTWARE,
+    ATTR_USERNAME,
+    ATTR_USE_CANDIDATE,
+    BINDING_REQUEST,
+    BINDING_RESPONSE,
+    XTS_ICE_PRIORITY,
+    XTS_ICE_SOFTWARE,
+    _build_xts_ice_binding_request,
+    _parse_stun,
 )
 from cloudedge.p2p.root_discovery import (
     _build_discovery_frame,
@@ -26,6 +41,52 @@ class _RegionApi:
     OPENAPI_BASE_URL = "https://openapi-usce.mearicloud.com"
     region = "us"
     session_data = {"mqtt": {"mqtt_host": "events-usce.mearicloud.com"}}
+
+
+def _stun_attributes(message):
+    attrs = []
+    message_length = struct.unpack_from(">H", message, 2)[0]
+    offset = 20
+    while offset < 20 + message_length:
+        attr_type, attr_length = struct.unpack_from(">HH", message, offset)
+        value = message[offset + 4 : offset + 4 + attr_length]
+        attrs.append((attr_type, value))
+        offset += 4 + ((attr_length + 3) & ~3)
+    return attrs
+
+
+def test_xts_ice_binding_request_matches_android_wire_format():
+    transaction_id = bytes.fromhex("ffca8ecd7f63bed25c9e5549")
+    request = _build_xts_ice_binding_request(
+        "0e17b3c5", "257130a3", "camera-password", transaction_id
+    )
+
+    assert struct.unpack_from(">H", request, 0)[0] == BINDING_REQUEST
+    assert struct.unpack_from(">H", request, 2)[0] == 104
+    assert request[8:20] == transaction_id
+    assert _stun_attributes(request)[:-1] == [
+        (ATTR_PRIORITY, struct.pack(">I", XTS_ICE_PRIORITY)),
+        (ATTR_USE_CANDIDATE, b""),
+        (ATTR_ICE_CONTROLLING, b"\x00" * 8),
+        (ATTR_SOFTWARE, XTS_ICE_SOFTWARE),
+        (ATTR_USERNAME, b"257130a3"),
+        (ATTR_USERNAME, b"257130a3:0e17b3c5"),
+    ]
+    assert _stun_attributes(request)[-1][0] == ATTR_MESSAGE_INTEGRITY
+
+
+def test_xts_ice_success_response_is_empty_like_android_client():
+    transaction_id = bytes.fromhex("0a95dfcb5cdf5f1c6b3ee2ea")
+    response = _build_ice_response(
+        {"txn_id": transaction_id}, "ignored", "192.168.1.30", 44431
+    )
+
+    assert len(response) == 20
+    assert _parse_stun(response) == {
+        "type": BINDING_RESPONSE,
+        "txn_id": transaction_id,
+        "attrs": {},
+    }
 
 
 def test_public_udp_peer_is_direct_after_ice_nomination():

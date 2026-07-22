@@ -57,8 +57,14 @@ ATTR_NONCE = 0x0015
 ATTR_XOR_RELAYED_ADDRESS = 0x0016
 ATTR_REQUESTED_TRANSPORT = 0x0019
 ATTR_XOR_MAPPED_ADDRESS = 0x0020
+ATTR_PRIORITY = 0x0024
+ATTR_USE_CANDIDATE = 0x0025
 ATTR_SOFTWARE = 0x8022
 ATTR_FINGERPRINT = 0x8028
+ATTR_ICE_CONTROLLING = 0x802A
+
+XTS_ICE_PRIORITY = 0xFFFFFF7E
+XTS_ICE_SOFTWARE = b"xts-ice-1.0.0"
 
 UDP_TRANSPORT_VALUE = 17  # UDP protocol number
 FINGERPRINT_XOR = 0x5354554E  # "STUN" in ASCII
@@ -111,6 +117,30 @@ def _add_integrity(msg_type, attrs_bytes, txn_id, key):
     hmac_val = hmac.new(key, header + attrs_bytes, hashlib.sha1).digest()
     attrs_bytes += _encode_attr(ATTR_MESSAGE_INTEGRITY, hmac_val)
     return attrs_bytes
+
+
+def _build_xts_ice_binding_request(
+    local_ufrag, remote_ufrag, remote_pwd, txn_id=None
+):
+    """Build the proprietary ICE check emitted by the Android XTS client."""
+    if txn_id is None:
+        txn_id = os.urandom(12)
+
+    # Attribute order and the duplicate USERNAME are intentional.  The camera
+    # uses the XTS ICE dialect seen in the official Android application's
+    # packet capture, rather than the usual libwebrtc connectivity check.
+    attrs = _encode_attr(ATTR_PRIORITY, struct.pack(">I", XTS_ICE_PRIORITY))
+    attrs += _encode_attr(ATTR_USE_CANDIDATE, b"")
+    attrs += _encode_attr(ATTR_ICE_CONTROLLING, b"\x00" * 8)
+    attrs += _encode_attr(ATTR_SOFTWARE, XTS_ICE_SOFTWARE)
+    attrs += _encode_attr(ATTR_USERNAME, remote_ufrag.encode())
+    attrs += _encode_attr(
+        ATTR_USERNAME, f"{remote_ufrag}:{local_ufrag}".encode()
+    )
+    attrs = _add_integrity(
+        BINDING_REQUEST, attrs, txn_id, remote_pwd.encode()
+    )
+    return _build_stun(BINDING_REQUEST, attrs, txn_id)[0]
 
 
 def _add_fingerprint(msg_type, attrs_bytes, txn_id):
@@ -450,26 +480,9 @@ class TurnClient:
         This is used for ICE connectivity checks. The binding request is
         sent as TURN data to the peer's address.
         """
-        username = f"{remote_ufrag}:{local_ufrag}"
-        # Build STUN Binding Request with ICE attributes
-        attrs = _encode_attr(ATTR_USERNAME, username.encode())
-
-        # PRIORITY attribute (0x0024)
-        attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
-
-        # ICE-CONTROLLING (0x802A)
-        attrs += _encode_attr(0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big")))
-
-        # USE-CANDIDATE (0x0025) - empty attribute
-        if use_candidate:
-            attrs += _encode_attr(0x0025, b"")
-
-        # Add MESSAGE-INTEGRITY with ICE password as key
-        txn_id = os.urandom(12)
-        ice_key = remote_pwd.encode()
-        attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, ice_key)
-
-        msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
+        msg = _build_xts_ice_binding_request(
+            local_ufrag, remote_ufrag, remote_pwd
+        )
 
         # Send through TURN relay
         self.send_to_peer(peer_ip, peer_port, msg)

@@ -29,19 +29,13 @@ from .meari_signaling import MsgSvrClient
 from .root_discovery import discover_msgsvr_endpoints
 from .turn_client import (
     TurnClient,
+    _build_xts_ice_binding_request,
     _parse_stun,
     _build_stun,
-    _encode_attr,
-    _add_integrity,
-    _encode_xor_address,
     _decode_xor_address,
     BINDING_REQUEST,
     BINDING_RESPONSE,
     DATA_INDICATION,
-    ATTR_USERNAME,
-    ATTR_XOR_MAPPED_ADDRESS,
-    ATTR_MESSAGE_INTEGRITY,
-    MAGIC_COOKIE,
     ATTR_DATA,
     ATTR_XOR_PEER_ADDRESS,
 )
@@ -365,12 +359,14 @@ def parse_stream_frame(data: bytes):
 def _build_ice_response(
     binding_req: dict, local_ice_pwd: str, peer_ip: str, peer_port: int
 ) -> bytes:
-    xor_addr = _encode_xor_address(peer_ip, peer_port)
-    attrs = _encode_attr(ATTR_XOR_MAPPED_ADDRESS, xor_addr)
+    """Return the empty Binding Success expected by the XTS ICE peer.
+
+    The Android client does not add XOR-MAPPED-ADDRESS or MESSAGE-INTEGRITY to
+    this response.  Matching that wire format is required for the camera to
+    nominate the candidate and begin its KCP handshake.
+    """
     txn_id = binding_req["txn_id"]
-    ice_key = local_ice_pwd.encode()
-    attrs = _add_integrity(BINDING_RESPONSE, attrs, txn_id, ice_key)
-    msg, _ = _build_stun(BINDING_RESPONSE, attrs, txn_id)
+    msg, _ = _build_stun(BINDING_RESPONSE, b"", txn_id)
     return msg
 
 
@@ -382,17 +378,9 @@ def _send_direct_ice_binding(
     remote_ufrag: str,
     remote_pwd: str,
 ) -> None:
-    username = f"{remote_ufrag}:{local_ufrag}"
-    attrs = _encode_attr(ATTR_USERNAME, username.encode())
-    attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
-    attrs += _encode_attr(
-        0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big"))
+    msg = _build_xts_ice_binding_request(
+        local_ufrag, remote_ufrag, remote_pwd
     )
-    attrs += _encode_attr(0x0025, b"")
-    txn_id = os.urandom(12)
-    ice_key = remote_pwd.encode()
-    attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, ice_key)
-    msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
     sock.sendto(msg, (peer_ip, peer_port))
 
 
