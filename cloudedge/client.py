@@ -17,6 +17,7 @@ import subprocess
 import socket
 import ipaddress
 import logging
+import tempfile
 from typing import Dict, List, Optional, Union, Any
 from urllib.parse import quote, urlencode
 
@@ -623,18 +624,27 @@ class CloudEdgeClient:
         owner-only (0600) and atomically (temp file + rename) so a crash
         mid-write can never leave a truncated file behind.
         """
-        tmp_path = f"{self.session_cache_file}.tmp"
+        cache_dir = os.path.dirname(os.path.abspath(self.session_cache_file))
+        cache_name = os.path.basename(self.session_cache_file)
+        tmp_path: Optional[str] = None
         try:
-            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, 'w') as f:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=cache_dir,
+                prefix=f".{cache_name}.",
+                suffix=".tmp",
+            )
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(session_data, f)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, self.session_cache_file)
         except Exception as e:
             self._log(f"Failed to save session cache: {e}")
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
             
     def _discover_endpoints(self) -> None:
         """Call the global redirect API to discover the correct regional server.
