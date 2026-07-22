@@ -234,7 +234,7 @@ class CloudEdgeMqttListener:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
 
-        _LOGGER.info("MQTT raw payload: %s", json.dumps(data, default=str)[:2000])
+        _LOGGER.debug("MQTT raw payload: %s", json.dumps(data, default=str)[:2000])
 
         original = data
 
@@ -280,7 +280,7 @@ class CloudEdgeMqttListener:
             if val:
                 extra[field] = str(val)
 
-        _LOGGER.info(
+        _LOGGER.debug(
             "MQTT event: %s  device=%s  motion=%s  url=%s",
             evt_name, device_id, is_motion, bool(extra.get("url")),
         )
