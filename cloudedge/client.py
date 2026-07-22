@@ -1236,6 +1236,10 @@ class CloudEdgeClient:
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
+                if str(error_code) in SESSION_INVALID_RESULT_CODES:
+                    raise AuthenticationError(
+                        f"Session rejected by API (Code: {error_code}): {error_msg}"
+                    )
                 raise CloudEdgeError(
                     f"Failed to retrieve home devices: {error_msg}",
                     details={"error_code": error_code, "message": error_msg, "home_id": home_id}
@@ -1271,6 +1275,8 @@ class CloudEdgeClient:
                 self._log(f"Found {len(default_devices)} devices via default home API")
                 all_devices.extend(default_devices)
                 return all_devices
+        except AuthenticationError:
+            raise
         except Exception as e:
             self._log(f"Default home API failed: {e}, trying home-based approach...")
         
@@ -1288,6 +1294,8 @@ class CloudEdgeClient:
                     home_devices = self.get_devices_by_home(home_id)
                     self._log(f"Found {len(home_devices)} devices in home '{home_name}'")
                     all_devices.extend(home_devices)
+                except AuthenticationError:
+                    raise
                 except Exception as e:
                     self._log(f"Failed to get devices from home '{home_name}': {e}")
                     
@@ -1406,6 +1414,10 @@ class CloudEdgeClient:
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
+                if str(error_code) in SESSION_INVALID_RESULT_CODES:
+                    raise AuthenticationError(
+                        f"Session rejected by API (Code: {error_code}): {error_msg}"
+                    )
                 raise CloudEdgeError(
                     f"Failed to retrieve devices: {error_msg}",
                     details={"error_code": error_code, "message": error_msg}

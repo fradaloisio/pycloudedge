@@ -280,5 +280,53 @@ class TestIntegration:
         assert hasattr(client, '_make_request')
 
 
+class TestSessionInvalidHandling:
+    """Session rejection must propagate as AuthenticationError."""
+
+    @staticmethod
+    def _authenticated_client() -> CloudEdgeClient:
+        client = CloudEdgeClient("user@example.com", "password", "US", "+1")
+        client.BASE_URL = "https://api.example.test"
+        client.OPENAPI_BASE_URL = "https://openapi.example.test"
+        client.session_data = {"userToken": "token", "userID": "user-id"}
+        return client
+
+    @staticmethod
+    def _session_invalid_response() -> Mock:
+        response = Mock()
+        response.json.return_value = {
+            "resultCode": "1023",
+            "resultMsg": "session invalid",
+        }
+        return response
+
+    def test_get_devices_raises_authentication_error_for_invalid_session(self):
+        client = self._authenticated_client()
+
+        with patch.object(
+            client, "_make_request", return_value=self._session_invalid_response()
+        ):
+            with pytest.raises(AuthenticationError):
+                client.get_devices()
+
+    def test_get_devices_by_home_raises_authentication_error_for_invalid_session(self):
+        client = self._authenticated_client()
+
+        with patch.object(
+            client, "_make_request", return_value=self._session_invalid_response()
+        ):
+            with pytest.raises(AuthenticationError):
+                client.get_devices_by_home("home-id")
+
+    def test_get_all_devices_does_not_swallow_authentication_error(self):
+        client = self._authenticated_client()
+
+        with patch.object(
+            client, "get_devices", side_effect=AuthenticationError("session invalid")
+        ):
+            with pytest.raises(AuthenticationError):
+                client.get_all_devices()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
