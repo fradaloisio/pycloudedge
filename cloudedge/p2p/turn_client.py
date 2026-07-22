@@ -190,12 +190,16 @@ class TurnClient:
         self.password = password
         self.realm = realm
         self.sock = None
+        self.peer_sock = None
         self.nonce = None
         self.relay_ip = None
         self.relay_port = None
         self.mapped_ip = None
         self.mapped_port = None
         self.local_port = None
+        self.peer_local_port = None
+        self.peer_mapped_ip = None
+        self.peer_mapped_port = None
         self._channel_counter = 0x4000
         self.channels = {}  # (ip, port) -> channel_number
         self.reverse_channels = {}  # channel_number -> (ip, port)
@@ -208,14 +212,25 @@ class TurnClient:
         ).digest()
 
     def connect(self):
-        """Create and bind UDP socket."""
+        """Create separate TURN-control and peer-media UDP sockets."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(5.0)
         self.sock.bind(("", 0))
         self.local_port = self.sock.getsockname()[1]
+
+        # The Android SDK never multiplexes TURN allocation and ICE/KCP on the
+        # same local socket.  The second socket supplies the host/srflx SDP
+        # candidates and remains the direct media path for the whole session.
+        self.peer_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.peer_sock.settimeout(5.0)
+        self.peer_sock.bind(("", 0))
+        self.peer_local_port = self.peer_sock.getsockname()[1]
         # Increase receive buffer to handle video data bursts (4MB)
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            self.peer_sock.setsockopt(
+                socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024
+            )
         except Exception:
             pass
 
@@ -305,6 +320,37 @@ class TurnClient:
                 self.mapped_port = struct.unpack(">H", data[2:4])[0]
                 self.mapped_ip = socket.inet_ntoa(data[4:8])
             return True
+        return False
+
+    def peer_stun_binding(self):
+        """Discover the public mapping of the dedicated ICE/media socket."""
+        txn_id = os.urandom(12)
+        request, _ = _build_stun(BINDING_REQUEST, b"", txn_id)
+        self.peer_sock.sendto(request, (self.server_ip, self.server_port))
+
+        for _attempt in range(20):
+            try:
+                raw, addr = self.peer_sock.recvfrom(65536)
+            except socket.timeout:
+                return False
+            if addr[0] != self.server_ip:
+                continue
+            response = _parse_stun(raw)
+            if (
+                not response
+                or response["type"] != BINDING_RESPONSE
+                or response["txn_id"] != txn_id
+            ):
+                continue
+            if ATTR_XOR_MAPPED_ADDRESS in response["attrs"]:
+                self.peer_mapped_ip, self.peer_mapped_port = _decode_xor_address(
+                    response["attrs"][ATTR_XOR_MAPPED_ADDRESS]
+                )
+            elif ATTR_MAPPED_ADDRESS in response["attrs"]:
+                data = response["attrs"][ATTR_MAPPED_ADDRESS]
+                self.peer_mapped_port = struct.unpack(">H", data[2:4])[0]
+                self.peer_mapped_ip = socket.inet_ntoa(data[4:8])
+            return bool(self.peer_mapped_ip and self.peer_mapped_port)
         return False
 
     def allocate(self):
@@ -494,3 +540,9 @@ class TurnClient:
             except Exception:
                 pass
             self.sock = None
+        if self.peer_sock:
+            try:
+                self.peer_sock.close()
+            except Exception:
+                pass
+            self.peer_sock = None

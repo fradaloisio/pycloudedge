@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import select
 import socket
 import struct
 import time
@@ -117,6 +118,68 @@ def _is_direct_peer_path(
 ) -> bool:
     """Return whether a packet arrived directly from a nominated ICE peer."""
     return not remote and not via_turn and peer_ip != turn_server_ip
+
+
+def _build_xts_sdp_offer(
+    *,
+    ice_ufrag: str,
+    ice_pwd: str,
+    local_ips: list[str],
+    peer_local_port: int,
+    peer_mapped_ip: str | None,
+    peer_mapped_port: int | None,
+    relay_ip: str,
+    relay_port: int,
+    remote: bool,
+) -> str:
+    """Build the SDP shape emitted by the Android XTS media client."""
+    lines = [
+        "n=0 0 0 0 0",
+        "a=transport:auto",
+        f"a=ice-ufrag:{ice_ufrag}",
+        f"a=ice-pwd:{ice_pwd}",
+        f"m=audio {relay_port} RTP / AVP 0",
+        f"c=IN IP4 {relay_ip}",
+    ]
+    if not remote:
+        for local_ip in local_ips:
+            foundation = format(int.from_bytes(socket.inet_aton(local_ip), "big"), "x")
+            lines.append(
+                f"a=candidate:H{foundation} 1 UDP 1694498815 "
+                f"{local_ip} {peer_local_port} typ host"
+            )
+        if peer_mapped_ip and peer_mapped_port:
+            foundation_ip = local_ips[0] if local_ips else "0.0.0.0"
+            foundation = format(
+                int.from_bytes(socket.inet_aton(foundation_ip), "big"), "x"
+            )
+            lines.append(
+                f"a=candidate:S{foundation} 1 UDP 1862270975 "
+                f"{peer_mapped_ip} {peer_mapped_port} typ srflx"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _recv_udp_batch(turn, timeout: float, limit: int = 2000):
+    """Receive pending packets from TURN and direct-media sockets."""
+    sockets = [turn.sock]
+    if turn.peer_sock is not None:
+        sockets.append(turn.peer_sock)
+    ready, _, _ = select.select(sockets, [], [], timeout)
+    packets = []
+    for recv_sock in ready:
+        previous_timeout = recv_sock.gettimeout()
+        recv_sock.setblocking(False)
+        try:
+            for _ in range(limit):
+                try:
+                    raw, addr = recv_sock.recvfrom(65536)
+                except (BlockingIOError, OSError):
+                    break
+                packets.append((raw, addr, recv_sock is turn.sock))
+        finally:
+            recv_sock.settimeout(previous_timeout)
+    return packets
 
 
 def _get_local_ips() -> list[str]:
@@ -744,6 +807,11 @@ class P2PStreamer:
             _LOGGER.error("TURN allocation failed")
             turn.close()
             return (0, 0)
+        if not remote and not turn.peer_stun_binding():
+            _LOGGER.warning(
+                "Could not discover the dedicated media socket's public mapping; "
+                "continuing with host and TURN paths"
+            )
 
         self._active_vvp_session = None
         try:
@@ -779,37 +847,20 @@ class P2PStreamer:
         ice_ufrag = os.urandom(4).hex()
         ice_pwd = os.urandom(12).hex()
 
-        # Build SDP offer
-        sdp_lines = [
-            "v=0",
-            f"o=- {int(time.time())} {int(time.time())} IN IP4 0.0.0.0",
-            "s=ice",
-            "t=0 0",
-            f"a=ice-ufrag:{ice_ufrag}",
-            f"a=ice-pwd:{ice_pwd}",
-            f"m=audio {turn.relay_port} RTP / AVP 0",
-            f"c=IN IP4 {turn.relay_ip}",
-        ]
-        if not remote:
-            for lip in local_ips:
-                ip_hex = socket.inet_aton(lip).hex()
-                sdp_lines.append(
-                    f"a=candidate:H{ip_hex} 1 UDP 1694498815 "
-                    f"{lip} {turn.local_port} typ host"
-                )
-        if not remote and turn.mapped_ip:
-            ip_hex = socket.inet_aton(local_ips[0]).hex()
-            sdp_lines.append(
-                f"a=candidate:S{ip_hex} 1 UDP 1862270975 "
-                f"{turn.mapped_ip} {turn.mapped_port} typ srflx"
-            )
-        if turn.relay_ip:
-            relay_hex = socket.inet_aton(turn.relay_ip).hex()
-            sdp_lines.append(
-                f"a=candidate:R{relay_hex} 1 UDP 16777215 "
-                f"{turn.relay_ip} {turn.relay_port} typ srflx"
-            )
-        sdp = "\n".join(sdp_lines) + "\n"
+        # Android advertises the relay only through m=/c=.  ICE host/srflx
+        # candidates belong to its separate media socket; it does not append a
+        # relay candidate disguised as srflx.
+        sdp = _build_xts_sdp_offer(
+            ice_ufrag=ice_ufrag,
+            ice_pwd=ice_pwd,
+            local_ips=local_ips,
+            peer_local_port=turn.peer_local_port,
+            peer_mapped_ip=turn.peer_mapped_ip,
+            peer_mapped_port=turn.peer_mapped_port,
+            relay_ip=turn.relay_ip,
+            relay_port=turn.relay_port,
+            remote=remote,
+        )
 
         # Send SDP offer
         answer = sig.send_offer(device_uuid, sdp)
@@ -956,7 +1007,7 @@ class P2PStreamer:
                 cp_ip, cp_port, is_direct = confirmed_peer[0]
                 if is_direct:
                     try:
-                        turn.sock.sendto(data, (cp_ip, cp_port))
+                        turn.peer_sock.sendto(data, (cp_ip, cp_port))
                     except Exception:
                         pass
                 else:
@@ -977,7 +1028,7 @@ class P2PStreamer:
                     pass
             for direct_send_addr in tuple(direct_send_addrs):
                 try:
-                    turn.sock.sendto(data, direct_send_addr)
+                    turn.peer_sock.sendto(data, direct_send_addr)
                 except Exception:
                     pass
 
@@ -994,7 +1045,7 @@ class P2PStreamer:
                 if not remote and c.get("type") != "relay":
                     try:
                         _send_direct_ice_binding(
-                            turn.sock,
+                            turn.peer_sock,
                             c["ip"],
                             c["port"],
                             ice_ufrag,
@@ -1043,8 +1094,6 @@ class P2PStreamer:
         got_iva_handshake = False
         login_ok = False
         direct_addr = None
-        turn.sock.settimeout(0.5)
-
         stream_frame_count = 0
         stream_video_count = 0
         stream_total_bytes = 0
@@ -1165,7 +1214,9 @@ class P2PStreamer:
             if not login_ok and now >= stun_keepalive_at:
                 try:
                     keepalive_msg, _ = _build_stun(BINDING_REQUEST, b"")
-                    turn.sock.sendto(keepalive_msg, (turn.server_ip, turn.server_port))
+                    turn.peer_sock.sendto(
+                        keepalive_msg, (turn.server_ip, turn.server_port)
+                    )
                 except Exception:
                     pass
                 stun_keepalive_at = now + 10
@@ -1173,20 +1224,8 @@ class P2PStreamer:
             # Batch drain
             if not _packet_buf:
                 kcp.flush_acks()
-                try:
-                    raw, addr = turn.sock.recvfrom(65536)
-                    _packet_buf.append((raw, addr))
-                    turn.sock.setblocking(False)
-                    try:
-                        for _ in range(2000):
-                            r2, a2 = turn.sock.recvfrom(65536)
-                            _packet_buf.append((r2, a2))
-                    except (BlockingIOError, OSError):
-                        pass
-                    finally:
-                        turn.sock.setblocking(True)
-                        turn.sock.settimeout(0.5)
-                except socket.timeout:
+                _packet_buf.extend(_recv_udp_batch(turn, 0.5))
+                if not _packet_buf:
                     if now >= ice_resend_at:
                         _send_ice_checks()
                         kcp.retransmit_unacked()
@@ -1196,16 +1235,16 @@ class P2PStreamer:
                         login_resend_at = now + 5
                     continue
 
-            raw, addr = _packet_buf.popleft()
+            raw, addr, from_turn_socket = _packet_buf.popleft()
             if len(raw) < 4:
                 continue
 
             data = raw
             source_addr = addr
-            via_turn = False
+            via_turn = from_turn_socket
 
             # Unwrap TURN framing
-            if (raw[0] & 0xC0) == 0x40:
+            if from_turn_socket and (raw[0] & 0xC0) == 0x40:
                 ch_num, length = struct.unpack(">HH", raw[:4])
                 data = raw[4 : 4 + length]
                 peer = turn.reverse_channels.get(ch_num)
@@ -1233,7 +1272,7 @@ class P2PStreamer:
             elif raw[0:2] != b"\xff\x01":
                 msg = _parse_stun(raw)
                 if msg:
-                    if msg["type"] == DATA_INDICATION:
+                    if from_turn_socket and msg["type"] == DATA_INDICATION:
                         inner_data = msg["attrs"].get(ATTR_DATA, b"")
                         pip, pport = None, None
                         if ATTR_XOR_PEER_ADDRESS in msg["attrs"]:
@@ -1280,12 +1319,12 @@ class P2PStreamer:
                         try:
                             if _is_direct_peer_path(
                                 remote=remote,
-                                via_turn=False,
+                                via_turn=from_turn_socket,
                                 peer_ip=addr[0],
                                 turn_server_ip=turn.server_ip,
                             ):
                                 direct_send_addrs.add(addr)
-                                turn.sock.sendto(resp, addr)
+                                turn.peer_sock.sendto(resp, addr)
                             else:
                                 turn.send_to_peer(addr[0], addr[1], resp)
                         except OSError:
@@ -1554,21 +1593,8 @@ class P2PStreamer:
         while self._running:
             if not _recv_buf:
                 kcp.flush_acks()
-                turn.sock.settimeout(0.5)
-                try:
-                    raw, addr = turn.sock.recvfrom(65536)
-                    _recv_buf.append((raw, addr))
-                    turn.sock.setblocking(False)
-                    try:
-                        for _ in range(2000):
-                            r2, a2 = turn.sock.recvfrom(65536)
-                            _recv_buf.append((r2, a2))
-                    except (BlockingIOError, OSError):
-                        pass
-                    finally:
-                        turn.sock.setblocking(True)
-                        turn.sock.settimeout(0.5)
-                except socket.timeout:
+                _recv_buf.extend(_recv_udp_batch(turn, 0.5))
+                if not _recv_buf:
                     now = time.time()
                     if host_key and now - last_heartbeat >= 10:
                         hb = build_vvp_packet(
@@ -1646,14 +1672,14 @@ class P2PStreamer:
                                 _process_kcp_message(q)
                     continue
 
-            raw, addr = _recv_buf.popleft()
+            raw, addr, from_turn_socket = _recv_buf.popleft()
             timeout_count = 0
             if len(raw) < 4:
                 continue
 
             # Unwrap TURN framing
             data = raw
-            if (raw[0] & 0xC0) == 0x40:
+            if from_turn_socket and (raw[0] & 0xC0) == 0x40:
                 ch, length = struct.unpack(">HH", raw[:4])
                 data = raw[4 : 4 + length]
                 inner_stun = _parse_stun(data)
@@ -1672,7 +1698,7 @@ class P2PStreamer:
             elif raw[0:2] != b"\xff\x01":
                 msg = _parse_stun(raw)
                 if msg:
-                    if msg["type"] == DATA_INDICATION:
+                    if from_turn_socket and msg["type"] == DATA_INDICATION:
                         inner = msg["attrs"].get(ATTR_DATA, b"")
                         pip, pport = None, None
                         if ATTR_XOR_PEER_ADDRESS in msg["attrs"]:
@@ -1695,8 +1721,8 @@ class P2PStreamer:
                     elif msg["type"] == BINDING_REQUEST and ice_pwd:
                         resp = _build_ice_response(msg, ice_pwd, addr[0], addr[1])
                         try:
-                            if _is_private_ip(addr[0]):
-                                turn.sock.sendto(resp, addr)
+                            if not from_turn_socket:
+                                turn.peer_sock.sendto(resp, addr)
                             else:
                                 turn.send_to_peer(addr[0], addr[1], resp)
                         except OSError:

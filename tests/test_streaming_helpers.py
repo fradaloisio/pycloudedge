@@ -12,6 +12,7 @@ from cloudedge.p2p.p2p_streamer import (
     VVP_CMD_START_LIVE,
     VVP_CMD_STOP,
     _build_ice_response,
+    _build_xts_sdp_offer,
     _is_direct_peer_path,
     _resolve_signaling_candidates,
     parse_stream_frame,
@@ -25,6 +26,7 @@ from cloudedge.p2p.turn_client import (
     ATTR_USE_CANDIDATE,
     BINDING_REQUEST,
     BINDING_RESPONSE,
+    TurnClient,
     XTS_ICE_PRIORITY,
     XTS_ICE_SOFTWARE,
     _build_xts_ice_binding_request,
@@ -87,6 +89,67 @@ def test_xts_ice_success_response_is_empty_like_android_client():
         "txn_id": transaction_id,
         "attrs": {},
     }
+
+
+def test_xts_sdp_uses_dedicated_media_socket_like_android_client():
+    sdp = _build_xts_sdp_offer(
+        ice_ufrag="0e17b3c5",
+        ice_pwd="6337191b3c50caf3561bd64a",
+        local_ips=["10.0.2.16", "10.215.173.1"],
+        peer_local_port=42510,
+        peer_mapped_ip="79.19.244.115",
+        peer_mapped_port=63771,
+        relay_ip="172.238.239.34",
+        relay_port=36218,
+        remote=False,
+    )
+
+    assert sdp == (
+        "n=0 0 0 0 0\n"
+        "a=transport:auto\n"
+        "a=ice-ufrag:0e17b3c5\n"
+        "a=ice-pwd:6337191b3c50caf3561bd64a\n"
+        "m=audio 36218 RTP / AVP 0\n"
+        "c=IN IP4 172.238.239.34\n"
+        "a=candidate:Ha000210 1 UDP 1694498815 10.0.2.16 42510 typ host\n"
+        "a=candidate:Had7ad01 1 UDP 1694498815 10.215.173.1 42510 typ host\n"
+        "a=candidate:Sa000210 1 UDP 1862270975 79.19.244.115 63771 typ srflx\n"
+    )
+    assert "candidate:R" not in sdp
+
+
+def test_turn_client_separates_turn_control_from_direct_media(monkeypatch):
+    class FakeSocket:
+        instances = []
+
+        def __init__(self, *args):
+            self.port = 41000 + len(self.instances)
+            self.instances.append(self)
+
+        def settimeout(self, timeout):
+            return None
+
+        def bind(self, address):
+            return None
+
+        def getsockname(self):
+            return ("0.0.0.0", self.port)
+
+        def setsockopt(self, *args):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("cloudedge.p2p.turn_client.socket.socket", FakeSocket)
+    turn = TurnClient("127.0.0.1", 9100, "user", "password")
+    try:
+        turn.connect()
+        assert turn.peer_sock is not turn.sock
+        assert turn.peer_local_port == turn.peer_sock.getsockname()[1]
+        assert turn.local_port == turn.sock.getsockname()[1]
+    finally:
+        turn.close()
 
 
 def test_public_udp_peer_is_direct_after_ice_nomination():
@@ -231,6 +294,9 @@ class _LifecycleTurn:
         return None
 
     def allocate(self):
+        return True
+
+    def peer_stun_binding(self):
         return True
 
     def close(self):
