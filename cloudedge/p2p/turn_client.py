@@ -18,9 +18,45 @@ The Meari Coturn server uses:
 import binascii
 import hashlib
 import hmac
+import logging
 import os
 import socket
 import struct
+
+
+class _SockTap(object):
+    """Non-intrusive wrapper around the UDP socket.
+
+    Logs the first time each source IP is seen. That distinguishes "the
+    camera never contacted us over the LAN" from "it did, but something
+    dropped the packets": without it, a fallback to the relay is silent and
+    impossible to diagnose. Everything but recvfrom is delegated to the
+    real socket.
+    """
+
+    def __init__(self, sock, logger):
+        self._sock = sock
+        self._logger = logger
+        self._seen = {}
+
+    def recvfrom(self, *args, **kwargs):
+        data, addr = self._sock.recvfrom(*args, **kwargs)
+        ip = addr[0] if addr else "?"
+        n = self._seen.get(ip, 0) + 1
+        self._seen[ip] = n
+        if n == 1:
+            self._logger.info(
+                "New source: first datagram from %s:%s (%d bytes)",
+                ip, addr[1] if addr else "?", len(data),
+            )
+        return data, addr
+
+    def sources(self):
+        return dict(self._seen)
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
 
 # STUN message types
 BINDING_REQUEST = 0x0001
@@ -177,12 +213,36 @@ class TurnClient:
             f"{self.username}:{self.realm}:{self.password}".encode()
         ).digest()
 
-    def connect(self):
-        """Create and bind UDP socket."""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def connect(self, bind_port: int = 0, sock=None):
+        """Create and bind the UDP socket.
+
+        In local mode the camera reaches out to the address advertised in
+        the awaken payload, and it does so as soon as it wakes up (~2.7s
+        after the request) - long before this point is reached. The socket
+        must therefore already be listening when that port is advertised:
+          - ``sock``: an already-bound socket created before the awaken.
+            Reused as-is (no rebind, no gap where nobody is listening).
+          - ``bind_port``: only used when there is no socket to reuse.
+        """
+        if sock is not None:
+            self.sock = sock
+        else:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                self.sock.bind(("", bind_port))
+            except OSError:
+                # port taken meanwhile: degrade to the relay, do not fail
+                self.sock.bind(("", 0))
         self.sock.settimeout(5.0)
-        self.sock.bind(("", 0))
         self.local_port = self.sock.getsockname()[1]
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "Media socket bound to port %d (reused=%s, requested=%s)",
+            self.local_port, sock is not None, bind_port or "ephemeral",
+        )
+        # non-intrusive tap: records the source of every datagram, so it is
+        # possible to tell whether the camera reached us over the LAN
+        self.sock = _SockTap(self.sock, logger)
         # Increase receive buffer to handle video data bursts (4MB)
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
