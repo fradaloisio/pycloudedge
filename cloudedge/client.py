@@ -39,6 +39,13 @@ from .constants import (
     CA_KEY, CA_SECRET, DEFAULT_HEADERS, DEFAULT_TIMEOUT,
     REDIRECT_URL,
 )
+# Brand parameters are read as module attributes instead of being imported
+# by name, so an integrator (e.g. a Home Assistant custom component for a
+# Meari rebrand) can override them in a single place:
+#     from cloudedge import constants; constants.SOURCE_APP = "82"
+# Importing them by name would bind the values at import time and silently
+# ignore any later override.
+from . import constants as _brand
 from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
 from .utils import retry_on_failure
@@ -647,16 +654,16 @@ class CloudEdgeClient:
         phone_code_bare = self.phone_code.lstrip("+")
         params = {
             "phoneType": "a",
-            "sourceApp": "8",
-            "appVer": "5.5.1",
-            "appVerCode": "551",
+            "sourceApp": _brand.SOURCE_APP,
+            "appVer": _brand.APP_VERSION,
+            "appVerCode": _brand.APP_VERSION_CODE,
             "localTime": str(timestamp),
             "t": str(timestamp),
             "lngType": "en",
             "countryCode": self.country_code,
             "userAccount": encrypted_account,
             "phoneCode": phone_code_bare,
-            "partnerId": "8",
+            "partnerId": _brand.PARTNER_ID,
             "nonce": query_nonce,
         }
 
@@ -767,8 +774,10 @@ class CloudEdgeClient:
         
         # Create signature
         ca_sign_data = (
-            f"phoneType=a&sourceApp=8&appVer=5.5.1&iotType=4&equipmentNo=&"
-            f"appVerCode=551&localTime={timestamp}&password={encrypted_password}&"
+            f"phoneType=a&sourceApp={_brand.SOURCE_APP}&appVer={_brand.APP_VERSION}"
+            f"&iotType=4&equipmentNo=&"
+            f"appVerCode={_brand.APP_VERSION_CODE}&localTime={timestamp}"
+            f"&password={encrypted_password}&"
             f"t={timestamp}&lngType=en&countryCode={self.country_code}&"
             f"userAccount={encrypted_username}&phoneCode={self.phone_code}"
         )
@@ -778,11 +787,11 @@ class CloudEdgeClient:
         
         login_data = {
             "phoneType": "a",
-            "sourceApp": "8",
-            "appVer": "5.5.1",
+            "sourceApp": _brand.SOURCE_APP,
+            "appVer": _brand.APP_VERSION,
             "iotType": "4",
             "equipmentNo": "",
-            "appVerCode": "551",
+            "appVerCode": _brand.APP_VERSION_CODE,
             "localTime": timestamp,
             "password": encrypted_password,
             "t": timestamp,

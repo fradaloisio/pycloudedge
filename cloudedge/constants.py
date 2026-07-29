@@ -20,12 +20,34 @@ DEFAULT_HEADERS = {
 }
 
 # API Constants
+#
+# Brand parameters: Meari is a white-label platform, the same backend serves
+# several apps, and ``sourceApp`` selects the brand namespace. An account
+# registered with one brand is rejected by another (resultCode 1017 at login),
+# so these have to match the app the account belongs to.
+#
+#   CloudEdge : sourceApp=8,  appVersion=5.5.1, appVersionCode=551, partnerId=8
+#   Cococam   : sourceApp=82, appVersion=6.1.1, appVersionCode=611, partnerId=82
+#
+# The values below are the CloudEdge ones, i.e. the previous behaviour. They are
+# read as module attributes (never imported by name), so an integrator can point
+# the library at another rebrand from a single place:
+#
+#   from cloudedge import constants
+#   constants.SOURCE_APP = "82"
+#
 PHONE_TYPE = "a"
 SOURCE_APP = "8"
 APP_VERSION = "5.5.1"
 IOT_TYPE = "4"
 APP_VERSION_CODE = "551"
+PARTNER_ID = "8"
 DEFAULT_LANGUAGE = "en"
+
+# Same, for the P2P layer: extra_params of the register call to the presence
+# server. Cococam sends brand=82 with v=6.1.1a8.0.0.
+P2P_BRAND = "77"
+P2P_APP_VER = "5.9.2a16"
 
 # Timeout values (seconds)
 DEFAULT_TIMEOUT = 30
