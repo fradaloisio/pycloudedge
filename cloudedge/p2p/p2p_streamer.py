@@ -47,6 +47,9 @@ from .turn_client import (
 )
 from .kcp_tunnel import KcpTunnel, parse_kcp_segment, parse_iva_frame
 from ..client import CloudEdgeClient
+# read as a module attribute, not imported by name: see the note in
+# client.py about the single override point for brand parameters
+from .. import constants as _brand
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -647,7 +650,8 @@ class P2PStreamer:
         client_id_val = api.session_data.get("userID", "")
         reg = sig.register(
             client_id=client_id_val,
-            brand="77",
+            brand=_brand.P2P_BRAND,
+            app_ver=_brand.P2P_APP_VER,
             country=api.country_code,
         )
 
