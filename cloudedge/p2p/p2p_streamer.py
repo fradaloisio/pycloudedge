@@ -116,6 +116,28 @@ def _is_private_ip(ip: str) -> bool:
     return False
 
 
+def _open_held_udp_socket():
+    """UDP socket opened and HELD open before the awaken request.
+
+    In local mode the camera is the one that reaches out to us, at the
+    address advertised in the awaken payload, and it does so as soon as it
+    wakes up (~2.7s after the request). The socket must therefore already be
+    listening when its port is advertised; it is handed over to TurnClient
+    later on, which reuses it as-is.
+
+    One port per streamer, so two cameras streaming at the same time cannot
+    collide - which a fixed port would not guarantee.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("", 0))
+    try:
+        # the camera's punch packets arrive while nobody is reading yet
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    except Exception:
+        pass
+    return s, int(s.getsockname()[1])
+
+
 def _get_local_ips() -> list[str]:
     ips: list[str] = []
     try:
@@ -600,6 +622,17 @@ class P2PStreamer:
 
         return status
 
+    def _close_wake_sock(self) -> None:
+        """Close the socket held for the awaken request, when the session
+        did not get far enough to hand it over to TurnClient."""
+        sock = getattr(self, "_wake_sock", None)
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            self._wake_sock = None
+
     def _wake_dormant_device(
         self,
         sig: MsgSvrClient,
@@ -608,8 +641,25 @@ class P2PStreamer:
     ) -> dict[str, Any] | None:
         keepalive = status.get("contact", {}).get("keepalive", {})
         if keepalive:
-            local_ips = _get_local_ips()
-            sig.send_wake_connect(device_uuid, keepalive, local_ips, 16685)
+            # This used to advertise a hardcoded port 16685 (the value seen
+            # in an Android app capture), while the media socket is bound to
+            # an ephemeral port in TurnClient.connect(). The camera knocked
+            # on a port nobody was listening on, so every session fell back
+            # to the TURN relay. Now the socket is opened first and its real
+            # port is what gets advertised.
+            self._wake_sock, self._wake_local_port = _open_held_udp_socket()
+            # link-local addresses (169.254/16) are unreachable for the
+            # camera: advertising them only wastes its connection attempts
+            local_ips = [ip for ip in _get_local_ips()
+                         if not ip.startswith("169.254.")]
+            _LOGGER.info(
+                "Awaken: advertising local endpoint %s port %d "
+                "(socket open and listening from now on)",
+                local_ips, self._wake_local_port,
+            )
+            sig.send_wake_connect(
+                device_uuid, keepalive, local_ips, self._wake_local_port
+            )
 
         try:
             self._api.wake_device(self._sn_num, self._device.get("device_id", 0))
@@ -674,10 +724,12 @@ class P2PStreamer:
                 dev_nat = online_status.get("nat", dev_nat)
             else:
                 _LOGGER.warning("Camera did not come online")
+                self._close_wake_sock()
                 return (0, 0)
 
         if dev_status != "online":
             _LOGGER.warning("Camera not online (status=%s)", dev_status)
+            self._close_wake_sock()
             return (0, 0)
 
         # Request TURN credentials
@@ -689,7 +741,14 @@ class P2PStreamer:
 
         # Allocate TURN relay
         turn = TurnClient(coturn_ip, coturn_port, coturn_user, coturn_pwd)
-        turn.connect()
+        # If the camera was woken up, reuse the socket that was already
+        # listening on the advertised port (the camera's punch packets
+        # landed in its buffer). If it was already online there is no
+        # socket to reuse and the original behaviour applies.
+        held_sock = getattr(self, "_wake_sock", None)
+        turn.connect(bind_port=0, sock=held_sock)
+        # from here the socket belongs to TurnClient: turn.close() frees it
+        self._wake_sock = None
         if not turn.allocate():
             _LOGGER.error("TURN allocation failed")
             turn.close()
@@ -1249,6 +1308,14 @@ class P2PStreamer:
                             not via_turn and not remote and _is_private_ip(cp_ip)
                         )
                         confirmed_peer[0] = (cp_ip, cp_port, is_direct)
+                        # the local/relay outcome was computed but never
+                        # logged; without this there is no way to tell if
+                        # video flows over the LAN or through the relay.
+                        _LOGGER.info(
+                            "Peer confirmed %s:%s direct=%s "
+                            "(via_turn=%s remote=%s)",
+                            cp_ip, cp_port, is_direct, via_turn, remote,
+                        )
                 if result:
                     rtype, rdata = result
                     if rtype == "handshake":
