@@ -403,11 +403,55 @@ class KcpTunnel:
                 return ("iva", payload)
             return None
 
-        # Check for KCP segment
-        seg = parse_kcp_segment(raw)
-        if not seg:
+        # A datagram can carry SEVERAL KCP segments back to back: the sender
+        # fills a buffer up to the MTU and only then puts it on the wire, so a
+        # short segment is routinely followed by another. Parsing only the first
+        # one and dropping the rest is indistinguishable from packet loss on the
+        # path, except that it cannot be repaired: the sender retransmits the
+        # same pair and the trailing segment lands in the same unread position
+        # every time, so the hole never closes and ordered delivery stops for
+        # good. Measured against a Meari camera over the vendor relay: every
+        # delivery hole in a session came from a trailing segment dropped here,
+        # one of them retransmitted and dropped three times over; iterating the
+        # datagram took a live window from 5s of video at 5fps to 30s at 15fps.
+        segments = []
+        offset = 0
+        while len(raw) - offset >= KCP_HEADER_SIZE:
+            seg = parse_kcp_segment(raw[offset:])
+            if not seg:
+                break
+            end = offset + KCP_HEADER_SIZE + seg["len"]
+            if end > len(raw):
+                break  # truncated segment: nothing reliable left in this packet
+            segments.append(seg)
+            offset = end
+        # Every datagram from this camera ends with one trailing byte that is not
+        # a segment; it is a constant suffix, so a short remainder is expected.
+
+        if not segments:
             return None
 
+        results = [self._handle_segment(seg) for seg in segments]
+
+        # Delivery order has to survive: callers act on the returned message and
+        # only then drain recv_queue, so further messages completed by the same
+        # datagram go to the back of that queue rather than being returned.
+        primary = None
+        fallback = None
+        for result in results:
+            if result is None:
+                continue
+            if result[0] in ("data", "handshake"):
+                if primary is None:
+                    primary = result
+                elif result[0] == "data":
+                    self.recv_queue.append(result[1])
+            elif fallback is None:
+                fallback = result
+        return primary or fallback
+
+    def _handle_segment(self, seg):
+        """Handle exactly one parsed KCP segment out of a datagram."""
         cmd = seg["cmd"]
 
         if cmd == KCP_CMD_PUSH:
