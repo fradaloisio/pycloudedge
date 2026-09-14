@@ -17,6 +17,7 @@ import subprocess
 import socket
 import ipaddress
 import logging
+import math
 import tempfile
 from typing import Dict, List, Optional, Union, Any
 from urllib.parse import quote, urlencode
@@ -512,10 +513,15 @@ class CloudEdgeClient:
         iv = "01234567".encode('utf-8')
         
         try:
-            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives.ciphers import Cipher, modes
             from cryptography.hazmat.primitives import padding
 
-            algorithm = algorithms.TripleDES(key)
+            try:
+                from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
+            except ImportError:  # cryptography < 43
+                from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES
+
+            algorithm = TripleDES(key)
             cipher = Cipher(algorithm, modes.CBC(iv))
             encryptor = cipher.encryptor()
             
@@ -606,14 +612,24 @@ class CloudEdgeClient:
             with open(self.session_cache_file, 'r') as f:
                 session_data = json.load(f)
 
-            # Check if session is still valid (not older than 24 hours)
-            login_time = session_data.get('loginTime', 0)
-            if time.time() - login_time > 86400:  # 24 hours
-                self._log("Session cache expired")
+            if not isinstance(session_data, dict):
+                return None
+            token = session_data.get("userToken")
+            user_id = session_data.get("userID")
+            if not isinstance(token, str) or not token or not isinstance(user_id, (str, int)) or not user_id:
+                return None
+
+            login_time = session_data.get("loginTime")
+            if (
+                not isinstance(login_time, (int, float))
+                or not math.isfinite(login_time)
+                or not 0 <= time.time() - login_time < 86400
+            ):
+                self._log("Session cache expired or has an invalid timestamp")
                 return None
 
             return session_data
-        except (json.JSONDecodeError, KeyError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             self._log("Invalid or unreadable session cache file")
             return None
 
@@ -769,6 +785,13 @@ class CloudEdgeClient:
                 self.BASE_URL = self.session_data["apiServer"]
             if self.session_data.get("openapiServer"):
                 self.OPENAPI_BASE_URL = self.session_data["openapiServer"]
+            # Older caches may predate endpoint discovery. Keep the valid token,
+            # but discover its regional URLs before making authenticated requests.
+            if not self.BASE_URL or not self.OPENAPI_BASE_URL:
+                self._discover_endpoints()
+                self.session_data["apiServer"] = self.BASE_URL
+                self.session_data["openapiServer"] = self.OPENAPI_BASE_URL
+                self._save_session_cache(self.session_data)
             # Fetch MQTT config if not already present in the cached session
             if not self.session_data.get("mqtt"):
                 try:
@@ -1307,7 +1330,11 @@ class CloudEdgeClient:
                 except AuthenticationError:
                     raise
                 except Exception as e:
-                    self._log(f"Failed to get devices from home '{home_name}': {e}")
+                    # A partial inventory would make callers remove devices
+                    # (and stop streams) during a temporary API outage.
+                    raise CloudEdgeError(
+                        f"Failed to get devices from home '{home_name}': {e}"
+                    ) from e
                     
             return all_devices
 
@@ -1993,18 +2020,17 @@ class CloudEdgeClient:
         # First try the get_all_devices method for comprehensive search
         devices = self.get_all_devices()
         
-        # Search for exact match first
-        for device in devices:
-            if device.get('name', '').lower() == device_name.lower():
-                return device
-                
-        # If exact match not found, try partial match
-        for device in devices:
-            if device_name.lower() in device.get('name', '').lower():
-                return device
-                
-        return None
-        
+        name = device_name.lower()
+        matches = [device for device in devices if device.get("name", "").lower() == name]
+        if not matches:
+            matches = [device for device in devices if name in device.get("name", "").lower()]
+        if len(matches) > 1:
+            raise DeviceNotFoundError(
+                f"Device name '{device_name}' is ambiguous; use a unique device name",
+                details={"device_name": device_name, "matches": len(matches)},
+            )
+        return matches[0] if matches else None
+
     def set_device_parameter(
         self,
         device_name: str,
