@@ -54,7 +54,7 @@ def test_legacy_cache_discovers_missing_endpoints_without_logging_in(client):
 
 def test_failed_home_discovery_does_not_return_partial_inventory(client):
     client.session_data = {"userToken": "token"}
-    client.get_devices = Mock(return_value=[])
+    client._get_owned_devices = Mock(return_value=[])
     client.get_homes = Mock(return_value=[
         {"home_id": "a", "name": "A"}, {"home_id": "b", "name": "B"},
     ])
@@ -63,6 +63,51 @@ def test_failed_home_discovery_does_not_return_partial_inventory(client):
     ])
     with pytest.raises(CloudEdgeError, match="temporarily unavailable"):
         client.get_all_devices()
+
+
+def test_owned_and_shared_devices_are_merged(client):
+    """Neither inventory is complete: shared homes only appear in the per-home
+    list, owned devices only in the legacy list."""
+    client.session_data = {"userToken": "token"}
+    client.get_homes = Mock(return_value=[
+        {"home_id": "own", "name": ""}, {"home_id": "shared", "name": "Colonna"},
+    ])
+    client.get_devices_by_home = Mock(side_effect=[
+        [], [{"serial_number": "sn-shared"}],
+    ])
+    client._get_owned_devices = Mock(return_value=[{"serial_number": "sn-owned"}])
+
+    devices = client.get_devices()
+
+    assert [d["serial_number"] for d in devices] == ["sn-shared", "sn-owned"]
+
+
+def test_devices_listed_by_both_endpoints_are_not_duplicated(client):
+    client.session_data = {"userToken": "token"}
+    client.get_homes = Mock(return_value=[{"home_id": "h", "name": "Home"}])
+    client.get_devices_by_home = Mock(return_value=[{"serial_number": "sn-1"}])
+    client._get_owned_devices = Mock(return_value=[{"serial_number": "sn-1"}])
+
+    assert len(client.get_devices()) == 1
+
+
+def test_owned_device_failure_keeps_home_inventory(client):
+    """A legacy endpoint going away must not take the whole inventory down."""
+    client.session_data = {"userToken": "token"}
+    client.get_homes = Mock(return_value=[{"home_id": "h", "name": "Home"}])
+    client.get_devices_by_home = Mock(return_value=[{"serial_number": "sn-1"}])
+    client._get_owned_devices = Mock(side_effect=NetworkError("gone"))
+
+    assert [d["serial_number"] for d in client.get_devices()] == ["sn-1"]
+
+
+def test_owned_device_failure_raises_when_nothing_else_was_found(client):
+    client.session_data = {"userToken": "token"}
+    client.get_homes = Mock(return_value=[])
+    client._get_owned_devices = Mock(side_effect=NetworkError("gone"))
+
+    with pytest.raises(NetworkError):
+        client.get_devices()
 
 
 @pytest.mark.parametrize("names, query", [
