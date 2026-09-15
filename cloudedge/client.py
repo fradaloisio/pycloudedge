@@ -203,6 +203,11 @@ class CloudEdgeClient:
         # Endpoints are discovered dynamically via _discover_endpoints()
         self.BASE_URL: Optional[str] = None
         self.OPENAPI_BASE_URL: Optional[str] = None
+
+        # Per-device OpenAPI credentials, keyed by the formatted device id.
+        # The cloud mints a fresh ``deviceSignature``/``t`` pair on every
+        # device-list call and rejects OpenAPI requests that omit them.
+        self._device_tokens: Dict[str, Dict[str, str]] = {}
         
         # Setup proper logging
         self.logger = get_logger("client")
@@ -487,6 +492,95 @@ class CloudEdgeClient:
             self.logger.error(f"Request failed: {url}")
             raise  # Let retry decorator handle it
         
+    def _remember_device_token(self, device: Dict) -> None:
+        """Store the OpenAPI credentials a device-list entry carries.
+
+        ``deviceSignature`` and its companion ``t`` are minted per listing;
+        ``/openapi/device/config`` rejects requests (errid 401 "STError")
+        unless both are echoed back together with ``clientid``.
+        """
+        signature = device.get("deviceSignature")
+        expires = device.get("t")
+        if not signature or not expires:
+            return
+        for raw in (device.get("snNum"), device.get("deviceID")):
+            if raw:
+                self._device_tokens[self._format_sn(str(raw))] = {
+                    "token": signature, "t": str(expires),
+                }
+
+    def _refresh_device_tokens(self) -> None:
+        """Re-mint the per-device OpenAPI credentials by listing the devices."""
+        try:
+            self.get_devices()
+        except Exception as exc:
+            self._log(f"Device list refresh failed: {exc}")
+
+    def _device_token_params(self, device_id: str) -> Dict[str, str]:
+        """OpenAPI query parameters that authorise a call for one device."""
+        entry = self._device_tokens.get(device_id)
+        if not entry:
+            # A caller may act on a device before ever listing them.
+            self._log(f"No OpenAPI token cached for {device_id}, refreshing device list")
+            self._refresh_device_tokens()
+            entry = self._device_tokens.get(device_id)
+        if not entry:
+            return {}
+        return {"token": entry["token"], "t": entry["t"],
+                "clientid": str(self.session_data.get("userID", ""))}
+
+    def _make_openapi_request(self, path: str, action: str, params: Dict,
+                              headers: Dict) -> requests.Response:
+        """Check cloud errors even when HTTP succeeds; refresh rejected keys once.
+
+        Never include the response body or signed URL in exceptions: they can
+        contain credentials. A failed renewal is throttled across devices.
+        """
+        for attempt in range(2):
+            keys = self.session_data.get("iotPlatformKeys", {})
+            signature, expires = self._get_signature_for_openapi(
+                path, action, keys["accesskey"]
+            )
+            signed_params = {**params, "accessid": keys["accessid"],
+                             "signature": signature, "expires": expires}
+            device_id = params.get("deviceid")
+            if device_id:
+                signed_params.update(self._device_token_params(device_id))
+            try:
+                response = self._make_request(
+                    "GET", f"{self.OPENAPI_BASE_URL}{path}", headers=headers,
+                    params=signed_params, timeout=DEFAULT_TIMEOUT,
+                )
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ConfigurationError("Invalid OpenAPI response format")
+                denied = str(data.get("errid")) == "401"
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is None or exc.response.status_code != 401:
+                    raise
+                denied = True
+            if denied:
+                now = time.monotonic()
+                last_refresh = getattr(self, "_last_openapi_auth_refresh", float("-inf"))
+                if attempt == 0 and now - last_refresh >= 60:
+                    self._last_openapi_auth_refresh = now
+                    self._fetch_iot_config(force_refresh=True)
+                    self._save_session_cache(self.session_data)
+                    # Device signatures expire too; a stale one is rejected
+                    # with the same 401 as stale platform credentials.
+                    self._device_tokens.clear()
+                    self._refresh_device_tokens()
+                    continue
+                raise AuthenticationError("OpenAPI authorization rejected (401)")
+            if str(data.get("errid", 0)) != "0":
+                raise ConfigurationError("OpenAPI returned an error",
+                                         details={"error_code": data.get("errid")})
+            if "resultCode" in data and str(data["resultCode"]) not in ("0", "1001"):
+                raise ConfigurationError("OpenAPI returned an error",
+                                         details={"error_code": data["resultCode"]})
+            return response
+        raise AuthenticationError("OpenAPI authorization rejected (401)")
+
     def _generate_timestamp(self) -> str:
         """Generate timestamp in CloudEdge format."""
         return datetime.datetime.now().astimezone().isoformat(timespec='seconds')
@@ -691,8 +785,8 @@ class CloudEdgeClient:
         params = {
             "phoneType": "a",
             "sourceApp": "8",
-            "appVer": "5.5.1",
-            "appVerCode": "551",
+            "appVer": "6.2.8",
+            "appVerCode": "643",
             "localTime": str(timestamp),
             "t": str(timestamp),
             "lngType": "en",
@@ -792,8 +886,11 @@ class CloudEdgeClient:
                 self.session_data["apiServer"] = self.BASE_URL
                 self.session_data["openapiServer"] = self.OPENAPI_BASE_URL
                 self._save_session_cache(self.session_data)
-            # Fetch MQTT config if not already present in the cached session
-            if not self.session_data.get("mqtt"):
+            # Migrate caches that still contain the login's bootstrap keys.
+            # The app uses the credentials decrypted from platform.signature.
+            if (not self.session_data.get("mqtt")
+                    or not self.session_data.get("iotCredentialsFromPlatform")
+                    or self.session_data.get("iotCredentialsExpireTime", 0) <= time.time()):
                 try:
                     self._fetch_iot_config()
                     self._save_session_cache(self.session_data)
@@ -820,13 +917,16 @@ class CloudEdgeClient:
         ca_timestamp = str(timestamp)
         ca_nonce = str(int(time.time() * 1000000) % 100000000)
         ca_key = "bc29be30292a4309877807e101afbd51"
+        # The app sends the dialling prefix without the leading "+"
+        phone_code_bare = self.phone_code.lstrip("+")
         
         # Create signature
         ca_sign_data = (
-            f"phoneType=a&sourceApp=8&appVer=5.5.1&iotType=4&equipmentNo=&"
-            f"appVerCode=551&localTime={timestamp}&password={encrypted_password}&"
+            f"phoneType=a&sourceApp=8&appVer=6.2.8&iotType=4&equipmentNo= &"
+            f"appVerCode=643&localTime={timestamp}&password={encrypted_password}&"
             f"t={timestamp}&lngType=en&countryCode={self.country_code}&"
-            f"userAccount={encrypted_username}&phoneCode={self.phone_code}"
+            f"userAccount={encrypted_username}&encryStatus=1&"
+            f"phoneCode={phone_code_bare}"
         )
         ca_signature = base64.b64encode(
             hmac.new(ca_key.encode(), ca_sign_data.encode(), hashlib.sha1).digest()
@@ -835,17 +935,18 @@ class CloudEdgeClient:
         login_data = {
             "phoneType": "a",
             "sourceApp": "8",
-            "appVer": "5.5.1",
+            "appVer": "6.2.8",
             "iotType": "4",
-            "equipmentNo": "",
-            "appVerCode": "551",
+            "equipmentNo": " ",
+            "appVerCode": "643",
             "localTime": timestamp,
             "password": encrypted_password,
             "t": timestamp,
             "lngType": "en",
             "countryCode": self.country_code,
             "userAccount": encrypted_username,
-            "phoneCode": self.phone_code
+            "encryStatus": "1",
+            "phoneCode": phone_code_bare
         }
         
         headers = {
@@ -945,7 +1046,7 @@ class CloudEdgeClient:
             unpadder = padding.PKCS7(128).unpadder()
             return (unpadder.update(padded) + unpadder.finalize()).decode("utf-8")
 
-    def _fetch_iot_config(self) -> None:
+    def _fetch_iot_config(self, force_refresh: bool = False) -> None:
         """Fetch MQTT and OpenAPI config from ``/v2/app/config/pf/init``.
 
         Decrypts the platform signature to obtain the real ``access_id`` and
@@ -962,7 +1063,7 @@ class CloudEdgeClient:
         ts = int(time.time() * 1000)
 
         params = {
-            'appVer': '5.5.1', 'appVerCode': '551', 'lngType': 'en',
+            'appVer': '6.2.8', 'appVerCode': '643', 'lngType': 'en',
             'phoneType': 'a', 'sdkVer': '1.0.0', 'sourceApp': '8',
             'countryCode': self.country_code,
             'phoneCode': self.phone_code,
@@ -972,6 +1073,8 @@ class CloudEdgeClient:
             't': str(ts), 'timestamp': str(ts),
             'userID': str(user_id),
         }
+        if force_refresh:
+            params['refresh'] = '1'
         sorted_keys = sorted(params.keys())
         content = "&".join(f"{k}={params[k]}" for k in sorted_keys)
         params['signature'] = base64.b64encode(
@@ -1029,6 +1132,15 @@ class CloudEdgeClient:
                 except Exception as exc:
                     self._log(f"Platform signature decryption failed: {exc}")
 
+            if access_id and access_key:
+                self.session_data["iotPlatformKeys"] = {
+                    **self.session_data.get("iotPlatformKeys", {}),
+                    "accessid": access_id,
+                    "accesskey": access_key,
+                }
+                self.session_data["iotCredentialsFromPlatform"] = True
+                self.session_data["iotCredentialsExpireTime"] = int(expire_time) / 1000
+
             mqtt_cfg = pf.get("mqtt", {})
             self.session_data["mqtt"] = {
                 "mqtt_host": mqtt_cfg.get("host", ""),
@@ -1073,8 +1185,8 @@ class CloudEdgeClient:
             raise AuthenticationError("Not authenticated")
             
         body = {
-            'appVer': '5.5.1',
-            'appVerCode': '551',
+            'appVer': '6.2.8',
+            'appVerCode': '643',
             'lngType': 'en',
             'phoneType': 'a',
             'sdkVer': '1.0.0',
@@ -1108,7 +1220,7 @@ class CloudEdgeClient:
         nonce = int(time.time())
         
         params_str = (
-            f"appVer=5.5.1&appVerCode=551&lngType=en&phoneType=a&"
+            f"appVer=6.2.8&appVerCode=643&lngType=en&phoneType=a&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
             f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
             f"userID={self.session_data['userID']}"
@@ -1205,7 +1317,7 @@ class CloudEdgeClient:
         nonce = int(time.time())
         
         params_str = (
-            f"appVer=5.5.1&appVerCode=551&homeID={home_id}&lngType=en&phoneType=a&"
+            f"appVer=6.2.8&appVerCode=643&homeID={home_id}&lngType=en&phoneType=a&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
             f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
             f"userID={self.session_data['userID']}"
@@ -1259,6 +1371,7 @@ class CloudEdgeClient:
                                     'device_icon_url': icon_url,
                                     **_extract_app_streaming_metadata(device),
                                 }
+                                self._remember_device_token(device)
                                 
                                 # Get enhanced online status
                                 device_dict['online'] = self._get_enhanced_device_status(device_dict)
@@ -1286,88 +1399,104 @@ class CloudEdgeClient:
     def get_all_devices(self) -> List[Dict]:
         """
         Get all devices from all homes associated with the account.
-        
+
+        Kept as an alias of :meth:`get_devices` so existing callers keep
+        working; both now return the same complete inventory.
+
         Returns:
             List[Dict]: List of all device information dictionaries
-            
+
         Raises:
             AuthenticationError: If not authenticated
             NetworkError: If network request fails
         """
-        if not self.session_data:
-            raise AuthenticationError("Not authenticated - call authenticate() first")
-            
-        self._log("Getting all devices from all homes...")
-        
-        all_devices = []
-        
-        # First try the default home API (works for device owners)
-        try:
-            default_devices = self.get_devices()
-            if default_devices:
-                self._log(f"Found {len(default_devices)} devices via default home API")
-                all_devices.extend(default_devices)
-                return all_devices
-        except AuthenticationError:
-            raise
-        except Exception as e:
-            self._log(f"Default home API failed: {e}, trying home-based approach...")
-        
-        # Fallback to home-based approach
-        try:
-            homes = self.get_homes()
-            self._log(f"Found {len(homes)} homes")
-            
-            for home in homes:
-                home_id = home['home_id']
-                home_name = home['name']
-                self._log(f"Getting devices from home '{home_name}' ({home_id})")
-                
-                try:
-                    home_devices = self.get_devices_by_home(home_id)
-                    self._log(f"Found {len(home_devices)} devices in home '{home_name}'")
-                    all_devices.extend(home_devices)
-                except AuthenticationError:
-                    raise
-                except Exception as e:
-                    # A partial inventory would make callers remove devices
-                    # (and stop streams) during a temporary API outage.
-                    raise CloudEdgeError(
-                        f"Failed to get devices from home '{home_name}': {e}"
-                    ) from e
-                    
-            return all_devices
+        return self.get_devices()
 
-        except AuthenticationError:
-            # Must propagate as-is: callers re-authenticate on this type,
-            # wrapping it in CloudEdgeError would hide the recovery signal.
-            raise
-        except Exception as e:
-            raise CloudEdgeError(f"Failed to get devices from homes: {e}")
-            
     def get_devices(self, home_id: Optional[str] = None) -> List[Dict]:
         """
         Get list of devices associated with the account.
-        
+
+        Without ``home_id`` this returns the **union** of both inventories the
+        cloud exposes, because neither one is complete on its own:
+
+        * ``/v1/app/home/join/device/list`` per home — the only source for
+          homes the account was invited to (``owner`` is False). This is what
+          the CloudEdge app itself calls.
+        * ``/ppstrongs/getDevice.action`` — the only source for devices the
+          account owns directly; the per-home endpoint returns an empty list
+          for the owner's own home even when it reports a device count.
+
         Args:
-            home_id (Optional[str]): Specific home ID to get devices from. 
-                                   If None, uses default home API.
-        
+            home_id (Optional[str]): Specific home ID to get devices from.
+                                   If None, every home plus the owned devices
+                                   are collected and de-duplicated.
+
         Returns:
             List[Dict]: List of device information dictionaries
-            
+
         Raises:
             AuthenticationError: If not authenticated
             NetworkError: If network request fails
         """
         if not self.session_data:
             raise AuthenticationError("Not authenticated - call authenticate() first")
-            
+
         # If home_id is specified, use home-based API
         if home_id:
             return self.get_devices_by_home(home_id)
-            
-        # Otherwise use default home API (default behavior)
+
+        return self._collect_all_devices()
+
+    def _collect_all_devices(self) -> List[Dict]:
+        """Merge the per-home and owned-device inventories.
+
+        Never returns a partial inventory: a caller that drops devices it
+        cannot see (Home Assistant removes their entities and stops their
+        streams) must not act on a transient API failure. The owned-device
+        endpoint is the one exception — once the homes answered, a failure
+        there is logged instead of raised, so a legacy endpoint going away
+        cannot take the whole inventory down with it.
+        """
+        devices: List[Dict] = []
+        seen = set()
+
+        def _add(items: List[Dict]) -> None:
+            for device in items:
+                key = device.get('serial_number') or device.get('device_id')
+                if key is None or key in seen:
+                    continue
+                seen.add(key)
+                devices.append(device)
+
+        homes = self.get_homes()
+        self._log(f"Collecting devices from {len(homes)} home(s)")
+        for home in homes:
+            try:
+                _add(self.get_devices_by_home(home['home_id']))
+            except AuthenticationError:
+                raise
+            except Exception as e:
+                raise CloudEdgeError(
+                    f"Failed to get devices from home '{home['name']}': {e}"
+                ) from e
+
+        try:
+            _add(self._get_owned_devices())
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            if not devices:
+                raise
+            self._log(f"Owned-device list failed, using home inventory only: {e}")
+
+        self._log(f"Collected {len(devices)} device(s) in total")
+        return devices
+
+    def _get_owned_devices(self) -> List[Dict]:
+        """Devices the account owns, via the legacy ``getDevice.action`` API."""
+        if not self.session_data:
+            raise AuthenticationError("Not authenticated - call authenticate() first")
+
         self._log("Getting devices from API...")
         
         device_body = self._generate_device_body()
@@ -1421,6 +1550,7 @@ class CloudEdgeClient:
                             'device_icon_url': icon_url,
                             **_extract_app_streaming_metadata(device),
                         }
+                        self._remember_device_token(device)
                         device_dict['online'] = self._get_enhanced_device_status(device_dict)
                         standardized_devices.append(device_dict)
 
@@ -1444,6 +1574,7 @@ class CloudEdgeClient:
                                 'device_icon_url': icon_url,
                                 **_extract_app_streaming_metadata(device),
                             }
+                            self._remember_device_token(device)
                             device_dict['online'] = self._get_enhanced_device_status(device_dict)
                             standardized_devices.append(device_dict)
 
@@ -1556,17 +1687,9 @@ class CloudEdgeClient:
             self._log("No OpenAPI credentials — cannot query dormancy status")
             return "unknown"
 
-        access_id = iot_keys['accessid']
-        access_key = iot_keys['accesskey']
         formatted_sn = self._format_sn(serial_number)
 
-        signature, timeout = self._get_signature_for_openapi(
-            '/openapi/device/status', 'query', access_key
-        )
         params = {
-            'accessid': access_id,
-            'expires': timeout,
-            'signature': signature,
             'action': 'query',
             'deviceid': formatted_sn,
         }
@@ -1576,12 +1699,8 @@ class CloudEdgeClient:
         }
 
         try:
-            response = self._make_request(
-                'GET',
-                f"{self.OPENAPI_BASE_URL}/openapi/device/status",
-                headers=headers,
-                params=params,
-                timeout=DEFAULT_TIMEOUT,
+            response = self._make_openapi_request(
+                "/openapi/device/status", "query", params, headers,
             )
             data = response.json()
             status = data.get('status', 'unknown')
@@ -1630,18 +1749,10 @@ class CloudEdgeClient:
         iot_keys = self.session_data.get('iotPlatformKeys', {})
         if iot_keys and 'accessid' in iot_keys and 'accesskey' in iot_keys:
             try:
-                access_id = iot_keys['accessid']
-                access_key = iot_keys['accesskey']
                 formatted_sn = self._format_sn(serial_number)
                 sid = (formatted_sn + str(int(time.time() * 1000)))[:30]
 
-                signature, timeout = self._get_signature_for_openapi(
-                    '/openapi/device/awaken', 'set', access_key
-                )
                 params = {
-                    'accessid': access_id,
-                    'expires': timeout,
-                    'signature': signature,
                     'action': 'set',
                     'deviceid': formatted_sn,
                     'sid': sid,
@@ -1650,12 +1761,8 @@ class CloudEdgeClient:
                     "Accept": "*/*",
                     "User-Agent": DEFAULT_HEADERS['User-Agent'],
                 }
-                response = self._make_request(
-                    'GET',
-                    f"{self.OPENAPI_BASE_URL}/openapi/device/awaken",
-                    headers=headers,
-                    params=params,
-                    timeout=DEFAULT_TIMEOUT,
+                response = self._make_openapi_request(
+                    "/openapi/device/awaken", "set", params, headers,
                 )
                 if response.status_code == 200:
                     self._log(f"OpenAPI wake sent for {serial_number}")
@@ -1824,11 +1931,7 @@ class CloudEdgeClient:
                 details={"device_serial": device_serial}
             )
             
-        access_id = iot_keys['accessid']
-        access_key = iot_keys['accesskey']
         
-        # Generate signature for OpenAPI
-        signature, timeout = self._get_signature_for_openapi('/openapi/device/config', 'get', access_key)
         
         # Format device SN
         formatted_sn = self._format_sn(device_serial)
@@ -1845,9 +1948,6 @@ class CloudEdgeClient:
         
         # Build request parameters
         params = {
-            'accessid': access_id,
-            'expires': timeout,
-            'signature': signature,
             'action': 'get',
             'deviceid': formatted_sn,
             'target': 'server',
@@ -1861,12 +1961,8 @@ class CloudEdgeClient:
         }
         
         try:
-            response = self._make_request(
-                'GET',
-                f"{self.OPENAPI_BASE_URL}/openapi/device/config",
-                headers=headers, 
-                params=params, 
-                timeout=DEFAULT_TIMEOUT
+            response = self._make_openapi_request(
+                "/openapi/device/config", "get", params, headers,
             )
             
             if response.status_code == 200:
@@ -1943,11 +2039,7 @@ class CloudEdgeClient:
                 details={"device_serial": device_serial, "parameters": list(parameters.keys())}
             )
             
-        access_id = iot_keys['accessid']
-        access_key = iot_keys['accesskey']
         
-        # Generate signature for OpenAPI
-        signature, timeout = self._get_signature_for_openapi('/openapi/device/config', 'set', access_key)
         
         # Format device SN
         formatted_sn = self._format_sn(device_serial)
@@ -1966,9 +2058,6 @@ class CloudEdgeClient:
         
         # Build request parameters
         params = {
-            'accessid': access_id,
-            'expires': timeout,
-            'signature': signature,
             'action': 'set',
             'deviceid': formatted_sn,
             'target': 'server',
@@ -1982,12 +2071,8 @@ class CloudEdgeClient:
         }
         
         try:
-            response = self._make_request(
-                'GET',
-                f"{self.OPENAPI_BASE_URL}/openapi/device/config",
-                headers=headers, 
-                params=params, 
-                timeout=DEFAULT_TIMEOUT
+            response = self._make_openapi_request(
+                "/openapi/device/config", "set", params, headers,
             )
             
             if response.status_code == 200:
@@ -1998,7 +2083,7 @@ class CloudEdgeClient:
                     self._log("Device configuration set successfully")
                     return True
                 else:
-                    raise ConfigurationError(f"Set config failed: {response_data}")
+                    raise ConfigurationError("Set config response did not confirm success")
             else:
                 raise ConfigurationError(f"Set config request failed: {response.status_code}")
                 

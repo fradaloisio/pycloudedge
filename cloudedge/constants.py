@@ -22,9 +22,9 @@ DEFAULT_HEADERS = {
 # API Constants
 PHONE_TYPE = "a"
 SOURCE_APP = "8"
-APP_VERSION = "5.5.1"
+APP_VERSION = "6.2.8"
 IOT_TYPE = "4"
-APP_VERSION_CODE = "551"
+APP_VERSION_CODE = "643"
 DEFAULT_LANGUAGE = "en"
 
 # Timeout values (seconds)
