@@ -34,7 +34,45 @@ def test_invalid_cache_is_ignored(client, data):
 def test_valid_cache_is_reused(client):
     session = {"loginTime": time.time(), "userToken": "token", "userID": "id"}
     client._save_session_cache(session)
-    assert client._load_session_cache() == session
+    loaded = client._load_session_cache()
+    assert loaded is not None
+    assert loaded["userToken"] == session["userToken"]
+    assert loaded["userID"] == session["userID"]
+
+
+def test_cache_is_bound_to_the_account(client):
+    """Two accounts sharing one cache path must never adopt each other's
+    session token."""
+    other = CloudEdgeClient(
+        "other@example.test", "password", "IT", "+39",
+        session_cache_file=client.session_cache_file,
+    )
+    client._save_session_cache(
+        {"loginTime": time.time(), "userToken": "token-a", "userID": "id"}
+    )
+
+    assert other._load_session_cache() is None
+    # The owning account still reuses its own entry.
+    assert client._load_session_cache()["userToken"] == "token-a"
+
+
+def test_cache_is_bound_to_the_region(client):
+    client._save_session_cache(
+        {"loginTime": time.time(), "userToken": "token", "userID": "id"}
+    )
+    client.country_code = "FR"
+
+    assert client._load_session_cache() is None
+
+
+def test_legacy_cache_without_identity_is_invalidated(client):
+    with open(client.session_cache_file, "w") as file:
+        json.dump(
+            {"loginTime": time.time(), "userToken": "token", "userID": "id"},
+            file,
+        )
+
+    assert client._load_session_cache() is None
 
 
 def test_legacy_cache_discovers_missing_endpoints_without_logging_in(client):
@@ -46,6 +84,7 @@ def test_legacy_cache_discovers_missing_endpoints_without_logging_in(client):
         client.OPENAPI_BASE_URL = "https://openapi.example.test"
     client._discover_endpoints = Mock(side_effect=discover)
     client._session.post = Mock(side_effect=AssertionError("Must reuse the token"))
+    client._session.get = Mock(side_effect=NetworkError("Platform temporarily unavailable"))
     assert client.authenticate() is True
     assert client.BASE_URL == "https://api.example.test"
     assert client.OPENAPI_BASE_URL == "https://openapi.example.test"
@@ -91,12 +130,25 @@ def test_devices_listed_by_both_endpoints_are_not_duplicated(client):
     assert len(client.get_devices()) == 1
 
 
-def test_owned_device_failure_keeps_home_inventory(client):
-    """A legacy endpoint going away must not take the whole inventory down."""
+def test_transient_owned_device_failure_fails_the_refresh(client):
+    """A network blip on the owned endpoint must not present a partial
+    inventory as complete: consumers would drop the devices they cannot
+    see (Home Assistant removes entities and stops their streams)."""
     client.session_data = {"userToken": "token"}
     client.get_homes = Mock(return_value=[{"home_id": "h", "name": "Home"}])
     client.get_devices_by_home = Mock(return_value=[{"serial_number": "sn-1"}])
     client._get_owned_devices = Mock(side_effect=NetworkError("gone"))
+
+    with pytest.raises(NetworkError):
+        client.get_devices()
+
+
+def test_permanent_owned_device_failure_keeps_home_inventory(client):
+    """A legacy endpoint going away must not take the whole inventory down."""
+    client.session_data = {"userToken": "token"}
+    client.get_homes = Mock(return_value=[{"home_id": "h", "name": "Home"}])
+    client.get_devices_by_home = Mock(return_value=[{"serial_number": "sn-1"}])
+    client._get_owned_devices = Mock(side_effect=CloudEdgeError("endpoint removed"))
 
     assert [d["serial_number"] for d in client.get_devices()] == ["sn-1"]
 

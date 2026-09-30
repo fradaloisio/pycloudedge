@@ -7,6 +7,8 @@ Implements just enough of RFC 5766 (TURN) to:
   2. Create permissions for the camera peer
   3. Bind a channel for efficient data transfer
   4. Send/receive data through the relay
+  5. Renew the allocation, permissions and channel bindings before they
+     expire (RFC 8656 sections 9 and 12)
 
 The Meari Coturn server uses:
   - Realm: "hangzhou"
@@ -21,6 +23,7 @@ import hmac
 import os
 import socket
 import struct
+import time
 
 # STUN message types
 BINDING_REQUEST = 0x0001
@@ -68,6 +71,36 @@ XTS_ICE_SOFTWARE = b"xts-ice-1.0.0"
 
 UDP_TRANSPORT_VALUE = 17  # UDP protocol number
 FINGERPRINT_XOR = 0x5354554E  # "STUN" in ASCII
+
+# Renewal lifetimes (RFC 8656).  Permissions expire after 300 s (§9),
+# channel bindings after 600 s (§12), and allocations after the lifetime
+# granted by the server.  Everything is renewed RENEWAL_MARGIN seconds
+# before it would actually expire.
+PERMISSION_LIFETIME = 300
+CHANNEL_BIND_LIFETIME = 600
+DEFAULT_ALLOCATION_LIFETIME = 600
+RENEWAL_MARGIN = 30.0
+
+
+class TurnError(RuntimeError):
+    """TURN protocol failure that requires building a new session."""
+
+
+class TurnRenewalRefusedError(TurnError):
+    """The server refused to renew an allocation, permission or binding."""
+
+
+def _renewal_delay(lifetime):
+    """Seconds after a grant when the object must be renewed."""
+    return lifetime - min(RENEWAL_MARGIN, lifetime / 2)
+
+
+def _error_code(resp):
+    """Return (code, reason) parsed from a STUN error response."""
+    err = resp.get("attrs", {}).get(ATTR_ERROR_CODE, b"")
+    if len(err) >= 4:
+        return err[2] * 100 + err[3], err[4:].decode("utf-8", errors="replace")
+    return 0, ""
 
 
 def _pad4(data):
@@ -183,7 +216,15 @@ def _parse_stun(data):
 class TurnClient:
     """Minimal TURN relay client."""
 
-    def __init__(self, server_ip, server_port, username, password, realm="hangzhou"):
+    def __init__(
+        self,
+        server_ip,
+        server_port,
+        username,
+        password,
+        realm="hangzhou",
+        clock=time.monotonic,
+    ):
         self.server_ip = server_ip
         self.server_port = server_port
         self.username = username
@@ -203,6 +244,14 @@ class TurnClient:
         self._channel_counter = 0x4000
         self.channels = {}  # (ip, port) -> channel_number
         self.reverse_channels = {}  # channel_number -> (ip, port)
+        # Separate renewal deadlines for the allocation, permissions and
+        # channel bindings (RFC 8656 §9/§12), read from `clock` so long
+        # sessions can be driven deterministically.
+        self._clock = clock
+        self._allocation_renew_at = None
+        self._last_allocation_refresh = None
+        self._permission_renew_at = {}  # peer_ip -> deadline
+        self._binding_renew_at = {}  # (ip, port) -> deadline
 
     @property
     def _key(self):
@@ -384,6 +433,14 @@ class TurnClient:
             if ATTR_XOR_MAPPED_ADDRESS in resp["attrs"]:
                 self.mapped_ip, self.mapped_port = _decode_xor_address(
                     resp["attrs"][ATTR_XOR_MAPPED_ADDRESS])
+            granted = DEFAULT_ALLOCATION_LIFETIME
+            lifetime_attr = resp["attrs"].get(ATTR_LIFETIME)
+            if lifetime_attr and len(lifetime_attr) >= 4:
+                granted = struct.unpack(">I", lifetime_attr)[0]
+            self._last_allocation_refresh = self._clock()
+            self._allocation_renew_at = (
+                self._clock() + _renewal_delay(granted)
+            )
             return True
         elif resp:
             err = resp["attrs"].get(ATTR_ERROR_CODE, b"")
@@ -394,45 +451,83 @@ class TurnClient:
 
         return False
 
-    def create_permission(self, peer_ip):
-        """Create permission for a peer IP."""
+    def create_permission(self, peer_ip, *, renewal=False):
+        """Create (or renew) a permission for a peer IP (RFC 8656 §9).
+
+        Returns True on success and False when the server cannot be reached.
+        When `renewal` is true, a server refusal raises
+        TurnRenewalRefusedError instead of returning False so the caller can
+        tear down and rebuild the session.
+        """
         addr_attr = _encode_attr(ATTR_XOR_PEER_ADDRESS,
                                  _encode_xor_address(peer_ip, 0))
         resp = self._stun_request(CREATE_PERM_REQUEST, addr_attr)
         if resp:
             if resp["type"] == CREATE_PERM_RESPONSE:
+                self._permission_renew_at[peer_ip] = (
+                    self._clock() + _renewal_delay(PERMISSION_LIFETIME)
+                )
                 return True
-            err_attr = resp.get("attrs", {}).get(ATTR_ERROR_CODE, b"")
-            if len(err_attr) >= 4:
-                err_code = err_attr[2] * 100 + err_attr[3]
-                print(f"[TURN] CreatePermission error for {peer_ip}: {err_code}")
+            code, reason = _error_code(resp)
+            if renewal:
+                raise TurnRenewalRefusedError(
+                    f"CreatePermission renewal for {peer_ip} refused: "
+                    f"{code} {reason}"
+                )
+            if code:
+                print(f"[TURN] CreatePermission error for {peer_ip}: {code}")
             return False
         print(f"[TURN] CreatePermission timeout for {peer_ip}")
         return False
 
-    def refresh(self, lifetime=600):
-        """Send TURN Refresh to verify allocation is alive."""
+    def refresh(self, lifetime=DEFAULT_ALLOCATION_LIFETIME):
+        """Refresh the TURN allocation (RFC 8656 §7).
+
+        Returns the granted lifetime in seconds, or None when the server
+        could not be reached (the caller should retry).  Raises
+        TurnRenewalRefusedError when the server actively refuses the
+        refresh, so a dead allocation is observable instead of silently
+        ignored.
+        """
         attrs = _encode_attr(ATTR_LIFETIME, struct.pack(">I", lifetime))
         resp = self._stun_request(REFRESH_REQUEST, attrs)
         if resp and resp["type"] == REFRESH_RESPONSE:
-            return True
+            granted = lifetime
+            lifetime_attr = resp["attrs"].get(ATTR_LIFETIME)
+            if lifetime_attr and len(lifetime_attr) >= 4:
+                granted = struct.unpack(">I", lifetime_attr)[0]
+            self._last_allocation_refresh = self._clock()
+            self._allocation_renew_at = (
+                self._clock() + _renewal_delay(granted)
+            )
+            return granted
         if resp:
-            err = resp["attrs"].get(ATTR_ERROR_CODE, b"")
-            if len(err) >= 4:
-                code = err[2] * 100 + err[3]
-                print(f"[TURN] Refresh error: {code}")
-        else:
-            print(f"[TURN] Refresh timeout")
-        return False
+            code, reason = _error_code(resp)
+            raise TurnRenewalRefusedError(
+                f"TURN Refresh refused: {code} {reason}"
+            )
+        print(f"[TURN] Refresh timeout")
+        return None
 
-    def channel_bind(self, peer_ip, peer_port):
-        """Bind a channel number to a peer address for efficient relay.
+    def channel_bind(self, peer_ip, peer_port, *, renewal=False):
+        """Bind (or renew) a channel for a peer address (RFC 8656 §12).
+
+        Re-binding a peer that already holds a channel reuses that channel
+        number: repeating the identical (channel, peer) pair refreshes the
+        binding, while allocating a new number would orphan the old binding
+        until it expires.
+
+        When `renewal` is true, a server refusal raises
+        TurnRenewalRefusedError instead of returning None.
 
         Retries if the first response is not a ChannelBind response
         (can happen when ICE checks arrive interleaved).
         """
-        ch = self._channel_counter
-        self._channel_counter += 1
+        key = (peer_ip, peer_port)
+        ch = self.channels.get(key)
+        if ch is None:
+            ch = self._channel_counter
+            self._channel_counter += 1
 
         attrs = _encode_attr(ATTR_CHANNEL_NUMBER, struct.pack(">HH", ch, 0))
         attrs += _encode_attr(ATTR_XOR_PEER_ADDRESS,
@@ -441,11 +536,20 @@ class TurnClient:
         for attempt in range(3):
             resp = self._stun_request(CHANNEL_BIND_REQUEST, attrs)
             if resp and resp["type"] == CHANNEL_BIND_RESPONSE:
-                self.channels[(peer_ip, peer_port)] = ch
-                self.reverse_channels[ch] = (peer_ip, peer_port)
+                self.channels[key] = ch
+                self.reverse_channels[ch] = key
+                self._binding_renew_at[key] = (
+                    self._clock() + _renewal_delay(CHANNEL_BIND_LIFETIME)
+                )
                 return ch
             if resp:
                 rtype = resp["type"]
+                if renewal and rtype == CHANNEL_BIND_REQUEST | 0x0110:
+                    code, reason = _error_code(resp)
+                    raise TurnRenewalRefusedError(
+                        f"ChannelBind renewal for {peer_ip}:{peer_port} "
+                        f"refused: {code} {reason}"
+                    )
                 # Check for error response
                 err_attr = resp.get("attrs", {}).get(ATTR_ERROR_CODE, b"")
                 if len(err_attr) >= 4:
@@ -462,6 +566,80 @@ class TurnClient:
                 print(f"[TURN] ChannelBind timeout for {peer_ip}:{peer_port} "
                       f"(attempt {attempt+1})")
         return None
+
+    def renew_due(self, allocation_refresh_interval=60.0):
+        """Renew everything whose expiry is due and report the next wait.
+
+        Refreshes the allocation when it comes within RENEWAL_MARGIN of its
+        granted lifetime or when `allocation_refresh_interval` seconds have
+        passed since the last refresh (whichever comes first), permissions
+        within RENEWAL_MARGIN of their 300 s expiry, and channel bindings
+        within RENEWAL_MARGIN of their 600 s expiry — reusing the channel
+        number already bound to each peer.
+
+        Returns the number of seconds after which renew_due() should be
+        called again (short when a request timed out and must be retried).
+        Raises TurnRenewalRefusedError when the server refuses a renewal, so
+        the caller can rebuild the session instead of ignoring it forever.
+        """
+        now = self._clock()
+        retry_soon = False
+
+        if self.nonce and (
+            (
+                self._allocation_renew_at is not None
+                and now >= self._allocation_renew_at
+            )
+            or (
+                self._last_allocation_refresh is not None
+                and now - self._last_allocation_refresh
+                >= allocation_refresh_interval
+            )
+        ):
+            if self.refresh() is None:
+                retry_soon = True
+
+        for peer_ip, renew_at in sorted(self._permission_renew_at.items()):
+            if now >= renew_at and not self.create_permission(
+                peer_ip, renewal=True
+            ):
+                retry_soon = True
+
+        for (peer_ip, peer_port), renew_at in sorted(
+            self._binding_renew_at.items()
+        ):
+            if now >= renew_at and self.channel_bind(
+                peer_ip, peer_port, renewal=True
+            ) is None:
+                retry_soon = True
+
+        if retry_soon:
+            return 5.0
+        return self.seconds_until_renewal(allocation_refresh_interval)
+
+    def seconds_until_renewal(self, allocation_refresh_interval=60.0):
+        """Seconds to wait before the next renew_due() call is necessary."""
+        now = self._clock()
+        waits = [allocation_refresh_interval]
+        if self._allocation_renew_at is not None:
+            waits.append(max(0.0, self._allocation_renew_at - now))
+        if self._last_allocation_refresh is not None:
+            waits.append(
+                max(
+                    0.0,
+                    allocation_refresh_interval
+                    - (now - self._last_allocation_refresh),
+                )
+            )
+        waits.extend(
+            max(0.0, renew_at - now)
+            for renew_at in self._permission_renew_at.values()
+        )
+        waits.extend(
+            max(0.0, renew_at - now)
+            for renew_at in self._binding_renew_at.values()
+        )
+        return min(waits)
 
     def send_to_peer(self, peer_ip, peer_port, data):
         """Send data to a peer through the TURN relay."""

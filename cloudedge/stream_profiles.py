@@ -1,4 +1,13 @@
-"""CloudEdge live-stream capability parsing and stream selection."""
+"""CloudEdge live-stream capability parsing and stream selection.
+
+Selection invariant: for any device dict, the stream ID returned by
+:func:`select_default_live_stream_id` (and every ID returned by
+:func:`select_live_stream_id`) is a member of the list returned by
+:func:`get_available_live_stream_ids` for the same device. Availability
+and default selection therefore read the same capability fields with the
+same rules: bps2 profile keys 0-4 map to stream IDs 100-104, and a
+``vst`` of 1 marks a single-stream device whose only stream is ID 0.
+"""
 
 import json
 import re
@@ -154,7 +163,9 @@ def get_available_live_stream_ids(device: Dict[str, Any]) -> List[int]:
 
     bps = _as_int(device.get("bps"), 0)
     if bps > 0:
-        return [stream_id for stream_id in range(10) if bps & (1 << stream_id)]
+        mask_ids = [stream_id for stream_id in range(10) if bps & (1 << stream_id)]
+        if mask_ids:
+            return mask_ids
     if _as_int(device.get("vst")) == 1:
         return [0]
     return [0, 1]
@@ -168,7 +179,8 @@ def select_default_live_stream_id(device: Dict[str, Any]) -> int:
         return 105
 
     source = _profile_source(device)
-    for profile_key in range(4):
+    # Same key space as get_live_stream_profiles(): keys 0-4 map to 100-104.
+    for profile_key in range(5):
         if str(profile_key) in source or profile_key in source:
             return 100 + profile_key
 
@@ -180,7 +192,10 @@ def select_default_live_stream_id(device: Dict[str, Any]) -> int:
                 return stream_id
 
     if "vst" in device:
-        return 1
+        # Match get_available_live_stream_ids(): vst=1 marks a single-stream
+        # device whose only choice is ID 0; other vst values keep the Android
+        # preference for the sub stream.
+        return 0 if _as_int(device.get("vst")) == 1 else 1
     return 0
 
 
@@ -188,6 +203,9 @@ def select_live_stream_id(device: Dict[str, Any], prefer_low: bool = False) -> i
     """Choose a default or lowest-resolution live stream for a consumer."""
     if not prefer_low:
         return select_default_live_stream_id(device)
+    # Same type-16 rule as the other selectors: stream 0 is the only choice.
+    if _as_int(device.get("type_id")) == 16:
+        return 0
 
     profiles = [
         profile

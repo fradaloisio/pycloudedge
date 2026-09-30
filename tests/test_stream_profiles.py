@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from cloudedge.client import _extract_app_streaming_metadata
 from cloudedge.p2p.p2p_streamer import P2PStreamer
 from cloudedge.stream_profiles import (
@@ -116,7 +118,85 @@ def test_device_type_16_forces_stream_zero():
     }
 
     assert select_default_live_stream_id(device) == 0
+    assert select_live_stream_id(device, prefer_low=True) == 0
     assert get_available_live_stream_ids(device) == [0]
+
+
+def test_single_stream_vst_device_defaults_to_its_only_stream():
+    device = {"vst": 1}
+
+    assert get_available_live_stream_ids(device) == [0]
+    assert select_default_live_stream_id(device) == 0
+    assert select_live_stream_id(device, prefer_low=True) == 0
+
+
+def test_dual_stream_vst_device_prefers_sub_stream():
+    device = {"vst": 2}
+
+    assert get_available_live_stream_ids(device) == [0, 1]
+    assert select_default_live_stream_id(device) == 1
+    assert select_live_stream_id(device, prefer_low=True) == 1
+
+
+def test_profile_key_four_is_default_when_it_is_the_only_profile():
+    device = {"bps2": {"4": "640x360@15"}}
+
+    assert get_available_live_stream_ids(device) == [104]
+    assert select_default_live_stream_id(device) == 104
+    assert select_live_stream_id(device, prefer_low=True) == 104
+
+
+def test_profile_key_four_stays_selectable_below_lower_keys():
+    device = {"bps2": {"0": "2304x1296@15", "4": "512x288@10"}}
+
+    assert get_available_live_stream_ids(device) == [100, 104]
+    assert select_default_live_stream_id(device) == 100
+    assert select_live_stream_id(device, prefer_low=True) == 104
+
+
+def test_bitrate_mask_without_usable_bits_falls_back_to_legacy_streams():
+    device = {"bps": 1 << 10}
+
+    assert get_available_live_stream_ids(device) == [0, 1]
+    assert select_default_live_stream_id(device) == 0
+    assert select_live_stream_id(device, prefer_low=True) == 1
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        {},
+        {"vst": 1},
+        {"vst": 2},
+        {"bps": (1 << 0) | (1 << 2)},
+        {"bps": 1 << 1},
+        {"bps": 1 << 10},
+        {"bps": (1 << 1) | (1 << 10)},
+        {
+            "type_id": 16,
+            "capability_version": 81,
+            "adb": 1,
+            "bps2": {"2": "640x360@15"},
+        },
+        {"type_id": 16, "bps2": {"0": "1920x1080@15", "2": "640x360@15"}},
+        {"bps2": {"2": "1280x720@15"}},
+        {"bps2": {"4": "640x360@15"}},
+        {"bps2": {"0": "2304x1296@15", "4": "512x288@10"}},
+        {
+            "capability_version": 81,
+            "adb": 1,
+            "bps2": {"0": "2304x1296@15", "2": "640x360@15"},
+        },
+        {"msc": [{"v_id": 1, "bps2": {"3": "320x180@10"}}]},
+        {"msc": json.dumps([{"v_id": 2, "bps2": {"4": "640x360@15"}}])},
+        {"bps2": json.dumps({"4": "640x360@15"})},
+    ],
+)
+def test_selected_stream_always_belongs_to_available_streams(device):
+    available = get_available_live_stream_ids(device)
+
+    assert select_default_live_stream_id(device) in available
+    assert select_live_stream_id(device, prefer_low=True) in available
 
 
 class _RefreshCapabilityApi:
