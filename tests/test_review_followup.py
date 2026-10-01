@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from unittest.mock import Mock
 
 import pytest
@@ -137,7 +137,7 @@ def test_inventory_waits_for_login_and_uses_the_new_session(client):
             reader = pool.submit(read)
             assert reader_started.wait(5)
             # The read must remain pending while login owns the transaction.
-            with pytest.raises(TimeoutError):
+            with pytest.raises(FutureTimeoutError):
                 reader.result(timeout=0.1)
         finally:
             release.set()
