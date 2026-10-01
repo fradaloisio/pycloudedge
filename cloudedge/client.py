@@ -19,10 +19,14 @@ import ipaddress
 import logging
 import math
 import tempfile
+import threading
+from contextlib import contextmanager
+from functools import wraps
 from typing import Dict, List, Optional, Union, Any
 from urllib.parse import quote, urlencode
 
 import requests
+from urllib3.util import Timeout
 
 from .exceptions import (
     CloudEdgeError, 
@@ -30,6 +34,7 @@ from .exceptions import (
     DeviceNotFoundError, 
     ConfigurationError,
     NetworkError,
+    RateLimitError,
     ValidationError
 )
 from .iot_parameters import (
@@ -44,12 +49,75 @@ from .constants import (
 from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
 from .stream_profiles import extract_stream_capabilities
-from .utils import retry_on_failure
+from .utils import parse_retry_after, retry_on_failure
 
 # Device online status values returned by get_device_online_status()
 DEVICE_STATUS_ONLINE = "online"
 DEVICE_STATUS_DORMANCY = "dormancy"
 DEVICE_STATUS_OFFLINE = "offline"
+
+# Minimum seconds between device-token refresh attempts. A device the cloud
+# keeps listing without a signature must not trigger a request storm of
+# inventory reloads.
+_TOKEN_REFRESH_THROTTLE = 30.0
+_MQTT_REFRESH_THROTTLE = 60.0
+
+
+def _serialized(method):
+    """Protect a complete credentials → signature → HTTP transaction.
+
+    Polling installs a per-thread deadline, including time spent waiting
+    for another authenticated transaction. Never decorate polling loops.
+    """
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        deadline = getattr(self._request_context, "deadline", None)
+        if deadline is None:
+            acquired = self._state_lock.acquire()
+        else:
+            remaining = deadline - time.monotonic()
+            acquired = remaining > 0 and self._state_lock.acquire(timeout=remaining)
+        if not acquired:
+            raise NetworkError("Request deadline exceeded waiting for client")
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._state_lock.release()
+    return guarded
+
+
+def _url_without_query(url: Any) -> str:
+    """Return the scheme/host/path of a URL, dropping the query string.
+
+    CloudEdge query strings carry signatures and tokens: they must never
+    reach exception messages or logs.
+    """
+    text = str(url or "")
+    return text.split("?", 1)[0]
+
+
+def _sanitize_request_exception(exc: Exception) -> str:
+    """Request failure text that is safe to expose.
+
+    Uses method-free facts only: HTTP status plus URL without query, or the
+    exception class for transport failures. The response body is never
+    included.
+    """
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        return f"HTTP {status} for {_url_without_query(getattr(response, 'url', ''))}"
+    request = getattr(exc, "request", None)
+    if request is not None:
+        return f"{type(exc).__name__} for {_url_without_query(getattr(request, 'url', ''))}"
+    return type(exc).__name__
+
+
+def _safe_exception_text(exc: Exception) -> str:
+    """Exception text safe for messages/logs: sanitized for HTTP requests."""
+    if isinstance(exc, requests.exceptions.RequestException):
+        return _sanitize_request_exception(exc)
+    return str(exc)
 
 # API list keys → readable product type when deviceTypeName is a CDN image URL
 _DEVICE_LIST_CATEGORY_LABELS = {
@@ -219,6 +287,20 @@ class CloudEdgeClient:
         self.enable_network_ping = enable_network_ping
         self.ping_timeout = ping_timeout
         
+        # Serializes authenticated operations and state transitions shared
+        # by coordinator and streaming threads (Home Assistant calls this
+        # client from multiple executor threads). Reentrant: public methods
+        # internally call other locked methods on the same thread.
+        # NOT held while sleeping in wait_for_online polling.
+        self._state_lock = threading.RLock()
+        self._request_context = threading.local()
+        # Re-entrancy guard + throttle for device-token refreshes.
+        self._refreshing_tokens = False
+        self._last_token_refresh = float("-inf")
+        self._last_iot_config_fetch = float("-inf")
+        # Ping availability probed once per client instance.
+        self._ping_available: Optional[bool] = None
+
         self.session_data: Optional[Dict] = None
         self._session = requests.Session()
         self._session.headers.update({'User-Agent': DEFAULT_HEADERS['User-Agent']})
@@ -334,16 +416,18 @@ class CloudEdgeClient:
             return False
     
     def _check_ping_availability(self) -> bool:
-        """Check if ping command is available on the system."""
+        """Check (once per client) whether the ping command is usable."""
+        if self._ping_available is not None:
+            return self._ping_available
         try:
             # Just try to run ping command with --help to check if it exists
             result = subprocess.run(["ping", "--help"], capture_output=True, text=True, timeout=5)
-            return True
-            
+            self._ping_available = True
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return False
+            self._ping_available = False
         except Exception:
-            return False
+            self._ping_available = False
+        return self._ping_available
 
     def _ping_device(self, ip_address: str) -> Optional[bool]:
         """
@@ -469,27 +553,73 @@ class CloudEdgeClient:
             "X-Ca-Nonce": ca_nonce
         }
     
-    @retry_on_failure(max_attempts=3, delay=1.0)
+    @contextmanager
+    def _request_budget(self, deadline):
+        """Scope a deadline to this thread, including nested token discovery."""
+        previous = getattr(self._request_context, "deadline", None)
+        self._request_context.deadline = min(previous, deadline) if previous is not None else deadline
+        try:
+            yield
+        finally:
+            self._request_context.deadline = previous
+
+    def _http_timeout(self, default=DEFAULT_TIMEOUT):
+        deadline = getattr(self._request_context, "deadline", None)
+        if deadline is None:
+            return default
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.Timeout("Request deadline exceeded")
+        return Timeout(total=remaining, connect=min(default, remaining), read=min(default, remaining))
+
+    @_serialized
     def _make_request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Make HTTP request with retry logic and error handling."""
+        return self._request_with_retry(
+            method, url,
+            _retry_deadline=getattr(self._request_context, "deadline", None),
+            **kwargs,
+        )
+
+    @retry_on_failure(max_attempts=3, delay=1.0)
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Make HTTP request with retry logic and error handling.
+
+        Retry classification (see utils.retry_on_failure): transport errors
+        (timeout, connection) and transient server errors (502/503/504) are
+        retried; other HTTP errors — including rate limiting — are raised
+        immediately. A 429 response is raised as :class:`RateLimitError`
+        carrying the server's ``Retry-After`` hint, never slept out here.
+        """
         # Never issue a request without a timeout: a hung connection would
         # otherwise block the caller (and its thread) forever.
-        kwargs.setdefault('timeout', DEFAULT_TIMEOUT)
+        kwargs['timeout'] = self._http_timeout(kwargs.get('timeout', DEFAULT_TIMEOUT))
         try:
             response = self._session.request(method, url, **kwargs)
+            if response.status_code == 429:
+                retry_after = parse_retry_after(response)
+                raise RateLimitError(
+                    "Rate limited by CloudEdge API (HTTP 429)",
+                    details={
+                        "url": _url_without_query(url),
+                        "retry_after": retry_after,
+                    },
+                    retry_after=retry_after,
+                )
             response.raise_for_status()
             return response
-        except requests.exceptions.Timeout as e:
-            self.logger.error(f"Request timeout: {url}")
+        except requests.exceptions.Timeout:
+            self.logger.error(f"Request timeout: {_url_without_query(url)}")
             raise  # Let retry decorator handle it
-        except requests.exceptions.ConnectionError as e:
-            self.logger.error(f"Connection error: {url}")
+        except requests.exceptions.ConnectionError:
+            self.logger.error(f"Connection error: {_url_without_query(url)}")
             raise  # Let retry decorator handle it
         except requests.exceptions.HTTPError as e:
-            self.logger.error(f"HTTP error {e.response.status_code}: {url}")
-            raise  # HTTP errors shouldn't be retried
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Request failed: {url}")
+            self.logger.error(
+                f"HTTP error {e.response.status_code}: {_url_without_query(url)}"
+            )
+            raise  # HTTP errors are classified by the retry decorator
+        except requests.exceptions.RequestException:
+            self.logger.error(f"Request failed: {_url_without_query(url)}")
             raise  # Let retry decorator handle it
         
     def _remember_device_token(self, device: Dict) -> None:
@@ -503,31 +633,57 @@ class CloudEdgeClient:
         expires = device.get("t")
         if not signature or not expires:
             return
-        for raw in (device.get("snNum"), device.get("deviceID")):
-            if raw:
-                self._device_tokens[self._format_sn(str(raw))] = {
-                    "token": signature, "t": str(expires),
-                }
+        entries = {
+            self._format_sn(str(raw)): {"token": signature, "t": str(expires)}
+            for raw in (device.get("snNum"), device.get("deviceID"))
+            if raw
+        }
+        with self._state_lock:
+            self._device_tokens.update(entries)
 
-    def _refresh_device_tokens(self) -> None:
-        """Re-mint the per-device OpenAPI credentials by listing the devices."""
+    @_serialized
+    def _refresh_device_tokens(self, *, force_refresh: bool = False) -> None:
+        """Re-mint the per-device OpenAPI credentials by listing the devices.
+
+        Walks the *plain* inventory (``enhance=False``): no ping-based
+        status and no OpenAPI reads, because that enrichment itself needs
+        these tokens — walking it here would recurse (inventory → config
+        for the IP → missing token → inventory → …). Re-entrant calls from
+        the same thread are ignored and retries are throttled, so a device
+        the cloud lists without a signature cannot cause a request storm.
+        """
+        with self._state_lock:
+            if self._refreshing_tokens:
+                return
+            now = time.monotonic()
+            if not force_refresh and now - self._last_token_refresh < _TOKEN_REFRESH_THROTTLE:
+                return
+            self._last_token_refresh = now
+            self._refreshing_tokens = True
         try:
-            self.get_devices()
+            self._collect_all_devices(enhance=False)
+        except (AuthenticationError, NetworkError, RateLimitError):
+            raise
         except Exception as exc:
-            self._log(f"Device list refresh failed: {exc}")
+            self._log(f"Device list refresh failed: {_safe_exception_text(exc)}")
+        finally:
+            self._refreshing_tokens = False
 
     def _device_token_params(self, device_id: str) -> Dict[str, str]:
         """OpenAPI query parameters that authorise a call for one device."""
-        entry = self._device_tokens.get(device_id)
-        if not entry:
-            # A caller may act on a device before ever listing them.
-            self._log(f"No OpenAPI token cached for {device_id}, refreshing device list")
-            self._refresh_device_tokens()
+        with self._state_lock:
             entry = self._device_tokens.get(device_id)
-        if not entry:
-            return {}
-        return {"token": entry["token"], "t": entry["t"],
-                "clientid": str(self.session_data.get("userID", ""))}
+            if not entry:
+                # A caller may act on a device before ever listing them.
+                self._log(
+                    f"No OpenAPI token cached for {device_id}, refreshing device list"
+                )
+                self._refresh_device_tokens()
+                entry = self._device_tokens.get(device_id)
+            if not entry:
+                return {}
+            return {"token": entry["token"], "t": entry["t"],
+                    "clientid": str(self.session_data.get("userID", ""))}
 
     def _make_openapi_request(self, path: str, action: str, params: Dict,
                               headers: Dict) -> requests.Response:
@@ -535,51 +691,63 @@ class CloudEdgeClient:
 
         Never include the response body or signed URL in exceptions: they can
         contain credentials. A failed renewal is throttled across devices.
+
+        The whole build→sign→send→renew cycle runs under ``_state_lock`` so
+        concurrent callers cannot interleave a credential renewal between a
+        signature build and its request, and two threads hitting 401 at the
+        same time perform at most one renewal.
         """
-        for attempt in range(2):
-            keys = self.session_data.get("iotPlatformKeys", {})
-            signature, expires = self._get_signature_for_openapi(
-                path, action, keys["accesskey"]
-            )
-            signed_params = {**params, "accessid": keys["accessid"],
-                             "signature": signature, "expires": expires}
-            device_id = params.get("deviceid")
-            if device_id:
-                signed_params.update(self._device_token_params(device_id))
-            try:
-                response = self._make_request(
-                    "GET", f"{self.OPENAPI_BASE_URL}{path}", headers=headers,
-                    params=signed_params, timeout=DEFAULT_TIMEOUT,
+        with self._state_lock:
+            for attempt in range(2):
+                keys = self.session_data.get("iotPlatformKeys", {})
+                signature, expires = self._get_signature_for_openapi(
+                    path, action, keys["accesskey"]
                 )
-                data = response.json()
-                if not isinstance(data, dict):
-                    raise ConfigurationError("Invalid OpenAPI response format")
-                denied = str(data.get("errid")) == "401"
-            except requests.exceptions.HTTPError as exc:
-                if exc.response is None or exc.response.status_code != 401:
-                    raise
-                denied = True
-            if denied:
-                now = time.monotonic()
-                last_refresh = getattr(self, "_last_openapi_auth_refresh", float("-inf"))
-                if attempt == 0 and now - last_refresh >= 60:
-                    self._last_openapi_auth_refresh = now
-                    self._fetch_iot_config(force_refresh=True)
-                    self._save_session_cache(self.session_data)
-                    # Device signatures expire too; a stale one is rejected
-                    # with the same 401 as stale platform credentials.
-                    self._device_tokens.clear()
-                    self._refresh_device_tokens()
-                    continue
-                raise AuthenticationError("OpenAPI authorization rejected (401)")
-            if str(data.get("errid", 0)) != "0":
-                raise ConfigurationError("OpenAPI returned an error",
-                                         details={"error_code": data.get("errid")})
-            if "resultCode" in data and str(data["resultCode"]) not in ("0", "1001"):
-                raise ConfigurationError("OpenAPI returned an error",
-                                         details={"error_code": data["resultCode"]})
-            return response
-        raise AuthenticationError("OpenAPI authorization rejected (401)")
+                signed_params = {**params, "accessid": keys["accessid"],
+                                 "signature": signature, "expires": expires}
+                device_id = params.get("deviceid")
+                if device_id:
+                    signed_params.update(self._device_token_params(device_id))
+                try:
+                    response = self._make_request(
+                        "GET", f"{self.OPENAPI_BASE_URL}{path}", headers=headers,
+                        params=signed_params, timeout=DEFAULT_TIMEOUT,
+                    )
+                    data = response.json()
+                    if not isinstance(data, dict):
+                        raise ConfigurationError("Invalid OpenAPI response format")
+                    denied = str(data.get("errid")) == "401"
+                except requests.exceptions.HTTPError as exc:
+                    if exc.response is None or exc.response.status_code != 401:
+                        raise NetworkError(
+                            f"OpenAPI request failed: {_sanitize_request_exception(exc)}"
+                        ) from None
+                    denied = True
+                except requests.exceptions.RequestException as exc:
+                    raise NetworkError(
+                        f"OpenAPI request failed: {_sanitize_request_exception(exc)}"
+                    ) from None
+                if denied:
+                    now = time.monotonic()
+                    last_refresh = getattr(self, "_last_openapi_auth_refresh", float("-inf"))
+                    if attempt == 0 and now - last_refresh >= 60:
+                        self._last_openapi_auth_refresh = now
+                        self._fetch_iot_config(force_refresh=True)
+                        self._save_session_cache(self.session_data)
+                        # Device signatures expire too; a stale one is rejected
+                        # with the same 401 as stale platform credentials.
+                        self._device_tokens.clear()
+                        self._refresh_device_tokens(force_refresh=True)
+                        continue
+                    raise AuthenticationError("OpenAPI authorization rejected (401)")
+                if str(data.get("errid", 0)) != "0":
+                    raise ConfigurationError("OpenAPI returned an error",
+                                             details={"error_code": data.get("errid")})
+                if "resultCode" in data and str(data["resultCode"]) not in ("0", "1001"):
+                    raise ConfigurationError("OpenAPI returned an error",
+                                             details={"error_code": data["resultCode"]})
+                return response
+            raise AuthenticationError("OpenAPI authorization rejected (401)")
 
     def _generate_timestamp(self) -> str:
         """Generate timestamp in CloudEdge format."""
@@ -697,11 +865,25 @@ class CloudEdgeClient:
         
         return signature, timeout
         
+    def _cache_identity(self) -> Dict[str, Any]:
+        """Account identity bound to a session cache entry (never secrets)."""
+        return {
+            "version": 2,
+            "username": self.username.strip().lower(),
+            "country_code": self.country_code,
+        }
+
     def _load_session_cache(self) -> Optional[Dict]:
-        """Load session data from cache file."""
+        """Load session data from cache file.
+
+        Only entries saved for this exact account (username + region) are
+        reusable. Legacy caches carry no identity: they are invalidated in a
+        controlled way instead of being assumed to belong to this account —
+        reusing another account's token would silently act as that account.
+        """
         if not os.path.exists(self.session_cache_file):
             return None
-            
+
         try:
             with open(self.session_cache_file, 'r') as f:
                 session_data = json.load(f)
@@ -722,6 +904,14 @@ class CloudEdgeClient:
                 self._log("Session cache expired or has an invalid timestamp")
                 return None
 
+            identity = session_data.get("_cache_identity")
+            if not isinstance(identity, dict):
+                self._log("Discarding legacy session cache without account identity")
+                return None
+            if identity != self._cache_identity():
+                self._log("Session cache belongs to a different account or region")
+                return None
+
             return session_data
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             self._log("Invalid or unreadable session cache file")
@@ -732,7 +922,9 @@ class CloudEdgeClient:
 
         The cache contains the account session token, so it is written
         owner-only (0600) and atomically (temp file + rename) so a crash
-        mid-write can never leave a truncated file behind.
+        mid-write can never leave a truncated file behind. The saved entry
+        carries the account identity so a different account sharing the
+        same path can never adopt this token; the password is never stored.
         """
         cache_dir = os.path.dirname(os.path.abspath(self.session_cache_file))
         cache_name = os.path.basename(self.session_cache_file)
@@ -744,9 +936,10 @@ class CloudEdgeClient:
                 suffix=".tmp",
             )
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(session_data, f)
+                json.dump({**session_data, "_cache_identity": self._cache_identity()}, f)
                 f.flush()
                 os.fsync(f.fileno())
+            os.chmod(tmp_path, 0o600)
             os.replace(tmp_path, self.session_cache_file)
         except Exception as e:
             self._log(f"Failed to save session cache: {e}")
@@ -756,6 +949,7 @@ class CloudEdgeClient:
                 except OSError:
                     pass
             
+    @_serialized
     def _discover_endpoints(self) -> None:
         """Call the global redirect API to discover the correct regional server.
 
@@ -823,7 +1017,7 @@ class CloudEdgeClient:
 
         try:
             resp = self._session.get(
-                REDIRECT_URL, params=params, headers=headers, timeout=DEFAULT_TIMEOUT,
+                REDIRECT_URL, params=params, headers=headers, timeout=self._http_timeout(),
             )
             data = resp.json()
             if data.get("resultCode") != "1001":
@@ -851,11 +1045,15 @@ class CloudEdgeClient:
         except NetworkError:
             raise
         except Exception as exc:
-            raise NetworkError(f"Endpoint discovery failed: {exc}") from exc
+            raise NetworkError(f"Endpoint discovery failed: {_safe_exception_text(exc)}") from None
 
     def authenticate(self, force_refresh: bool = False) -> bool:
         """
         Authenticate with CloudEdge API.
+
+        Thread-safety: serialized with every other authenticated operation
+        through the client's internal state lock. Concurrent callers cannot
+        interleave logins or observe a half-updated session.
 
         Args:
             force_refresh: Skip the cached session and perform a fresh
@@ -864,36 +1062,50 @@ class CloudEdgeClient:
                 file on disk still looks valid but the session is dead.
 
         Returns:
-            bool: True if authentication successful, False otherwise
+            bool: ``True`` when this call established or reused a usable
+                session. Never returns ``False``: rejected credentials and
+                unreachable servers raise instead (see below).
 
         Raises:
-            AuthenticationError: If authentication fails
-            NetworkError: If network request fails
+            AuthenticationError: The server rejected the credentials, the
+                cached token is no longer valid, or the login response was
+                malformed. The previous session, if any, is left unchanged.
+            NetworkError: The login or endpoint-discovery request failed
+                for transport reasons (timeout, DNS, connection). Retrying
+                later may succeed; this is not a credentials problem.
         """
-        # Try to load cached session first
-        self.session_data = None if force_refresh else self._load_session_cache()
-        if self.session_data:
+        with self._state_lock:
+            return self._authenticate_locked(force_refresh)
+
+    def _authenticate_locked(self, force_refresh: bool) -> bool:
+        # Never clear a working session during login. Authenticated API
+        # readers hold the same lock, including while cached IoT keys refresh.
+        cached = None if force_refresh else self._load_session_cache()
+        if cached:
             self._log("Using cached session")
             # Restore discovered endpoints from cache if present
-            if self.session_data.get("apiServer"):
-                self.BASE_URL = self.session_data["apiServer"]
-            if self.session_data.get("openapiServer"):
-                self.OPENAPI_BASE_URL = self.session_data["openapiServer"]
+            if cached.get("apiServer"):
+                self.BASE_URL = cached["apiServer"]
+            if cached.get("openapiServer"):
+                self.OPENAPI_BASE_URL = cached["openapiServer"]
             # Older caches may predate endpoint discovery. Keep the valid token,
             # but discover its regional URLs before making authenticated requests.
             if not self.BASE_URL or not self.OPENAPI_BASE_URL:
                 self._discover_endpoints()
-                self.session_data["apiServer"] = self.BASE_URL
-                self.session_data["openapiServer"] = self.OPENAPI_BASE_URL
-                self._save_session_cache(self.session_data)
+                cached["apiServer"] = self.BASE_URL
+                cached["openapiServer"] = self.OPENAPI_BASE_URL
+                self._save_session_cache(cached)
+            self.session_data = cached
+            self._device_tokens.clear()
+            self._last_token_refresh = float("-inf")
             # Migrate caches that still contain the login's bootstrap keys.
             # The app uses the credentials decrypted from platform.signature.
-            if (not self.session_data.get("mqtt")
-                    or not self.session_data.get("iotCredentialsFromPlatform")
-                    or self.session_data.get("iotCredentialsExpireTime", 0) <= time.time()):
+            if (not cached.get("mqtt")
+                    or not cached.get("iotCredentialsFromPlatform")
+                    or cached.get("iotCredentialsExpireTime", 0) <= time.time()):
                 try:
                     self._fetch_iot_config()
-                    self._save_session_cache(self.session_data)
+                    self._save_session_cache(cached)
                 except Exception as exc:
                     self._log(f"IoT config fetch failed (non-fatal): {exc}")
             return True
@@ -916,7 +1128,7 @@ class CloudEdgeClient:
         # Generate headers
         ca_timestamp = str(timestamp)
         ca_nonce = str(int(time.time() * 1000000) % 100000000)
-        ca_key = "bc29be30292a4309877807e101afbd51"
+        ca_key = CA_KEY
         # The app sends the dialling prefix without the leading "+"
         phone_code_bare = self.phone_code.lstrip("+")
         
@@ -965,7 +1177,7 @@ class CloudEdgeClient:
                 f"{self.BASE_URL}/meari/app/login", 
                 headers=headers, 
                 data=login_data,
-                timeout=30
+                timeout=self._http_timeout(30)
             )
             response.raise_for_status()
             response_data = response.json()
@@ -980,7 +1192,7 @@ class CloudEdgeClient:
                 if not user_token or not user_id:
                     raise AuthenticationError(
                         "Missing user token or ID in response",
-                        details={"response": response_data}
+                        details={"error_code": response_data.get("resultCode")},
                     )
                 
                 # Extract IoT platform keys if available
@@ -997,6 +1209,9 @@ class CloudEdgeClient:
                     "openapiServer": self.OPENAPI_BASE_URL,
                     "iotPlatformKeys": iot_platform_keys,
                 }
+                self._device_tokens.clear()
+                self._last_token_refresh = float("-inf")
+                self._last_openapi_auth_refresh = float("-inf")
 
                 # Fetch MQTT / IoT platform config (host, port, mqtt signature)
                 try:
@@ -1015,7 +1230,11 @@ class CloudEdgeClient:
                 )
                 
         except requests.exceptions.RequestException as e:
-            raise NetworkError(f"Login request failed: {e}")
+            # Never chain the raw request exception: its text (and traceback)
+            # would print the signed login URL.
+            raise NetworkError(
+                f"Login request failed: {_sanitize_request_exception(e)}"
+            ) from None
         except json.JSONDecodeError:
             raise AuthenticationError("Failed to parse login response")
             
@@ -1046,6 +1265,7 @@ class CloudEdgeClient:
             unpadder = padding.PKCS7(128).unpadder()
             return (unpadder.update(padded) + unpadder.finalize()).decode("utf-8")
 
+    @_serialized
     def _fetch_iot_config(self, force_refresh: bool = False) -> None:
         """Fetch MQTT and OpenAPI config from ``/v2/app/config/pf/init``.
 
@@ -1053,86 +1273,107 @@ class CloudEdgeClient:
         ``access_key`` required by the MQTT broker.  Stores results in
         ``self.session_data["mqtt"]``.
 
+        Only a config with usable credentials is published: when the
+        platform signature cannot be decrypted, an existing config of this
+        same session is kept (unless its credentials are known to be
+        expired) instead of being overwritten with empty values that would
+        make an MQTT listener retry forever with a blank username.
+
         Called automatically after a successful :meth:`authenticate`.
         """
         if not self.session_data:
             return
+        with self._state_lock:
+            self._last_iot_config_fetch = time.monotonic()
+            user_token = self.session_data["userToken"]
+            user_id = self.session_data["userID"]
+            ts = int(time.time() * 1000)
 
-        user_token = self.session_data["userToken"]
-        user_id = self.session_data["userID"]
-        ts = int(time.time() * 1000)
+            params = {
+                'appVer': '6.2.8', 'appVerCode': '643', 'lngType': 'en',
+                'phoneType': 'a', 'sdkVer': '1.0.0', 'sourceApp': '8',
+                'countryCode': self.country_code,
+                'phoneCode': self.phone_code,
+                'iotType': '4',
+                'signatureMethod': 'HMAC-SHA1', 'signatureVersion': '1.0',
+                'signatureNonce': str(ts),
+                't': str(ts), 'timestamp': str(ts),
+                'userID': str(user_id),
+            }
+            if force_refresh:
+                params['refresh'] = '1'
+            sorted_keys = sorted(params.keys())
+            content = "&".join(f"{k}={params[k]}" for k in sorted_keys)
+            params['signature'] = base64.b64encode(
+                hmac.new(user_token.encode(), content.encode(), hashlib.sha1).digest()
+            ).decode()
 
-        params = {
-            'appVer': '6.2.8', 'appVerCode': '643', 'lngType': 'en',
-            'phoneType': 'a', 'sdkVer': '1.0.0', 'sourceApp': '8',
-            'countryCode': self.country_code,
-            'phoneCode': self.phone_code,
-            'iotType': '4',
-            'signatureMethod': 'HMAC-SHA1', 'signatureVersion': '1.0',
-            'signatureNonce': str(ts),
-            't': str(ts), 'timestamp': str(ts),
-            'userID': str(user_id),
-        }
-        if force_refresh:
-            params['refresh'] = '1'
-        sorted_keys = sorted(params.keys())
-        content = "&".join(f"{k}={params[k]}" for k in sorted_keys)
-        params['signature'] = base64.b64encode(
-            hmac.new(user_token.encode(), content.encode(), hashlib.sha1).digest()
-        ).decode()
-
-        xca_headers = self._generate_xca_headers(
-            f"api=/ppstrongs/v2/app/config/pf/init"
-            f"|X-Ca-Key={user_token}"
-            f"|X-Ca-Timestamp={str(ts)}"
-            f"|X-Ca-Nonce={str(ts % 100000000)}",
-            user_token,
-        )
-
-        try:
-            resp = self._session.get(
-                f"{self.BASE_URL}/v2/app/config/pf/init",
-                params=params,
-                headers={**DEFAULT_HEADERS, **xca_headers},
-                timeout=DEFAULT_TIMEOUT,
+            xca_headers = self._generate_xca_headers(
+                f"api=/ppstrongs/v2/app/config/pf/init"
+                f"|X-Ca-Key={user_token}"
+                f"|X-Ca-Timestamp={str(ts)}"
+                f"|X-Ca-Nonce={str(ts % 100000000)}",
+                user_token,
             )
-            data = resp.json()
-            if data.get("resultCode") != "1001":
-                self._log(f"IoT config response: {data.get('resultCode')}")
-                return
 
-            pf = data.get("result", {}).get("pfApi", {})
+            try:
+                resp = self._session.get(
+                    f"{self.BASE_URL}/v2/app/config/pf/init",
+                    params=params,
+                    headers={**DEFAULT_HEADERS, **xca_headers},
+                    timeout=self._http_timeout(),
+                )
+                data = resp.json()
+                if data.get("resultCode") != "1001":
+                    self._log(f"IoT config response: {data.get('resultCode')}")
+                    return
 
-            # ── Decrypt platform signature to get real access_id/key ─────
-            #
-            # The MQTT broker authenticates with the *decrypted* access_id
-            # (not the raw "mearicloud" value from the login response).
-            # Key derivation: base64(userID + PARTNER_ID + TTID + expireTime)[:16]
-            PARTNER_ID = "8"
-            TTID = "a"
+                pf = data.get("result", {}).get("pfApi", {})
 
-            access_id = ""
-            access_key = ""
-            platform = pf.get("platform", {})
-            plat_sig = platform.get("signature", "")
-            expire_time = str(platform.get("expireTime", ""))
+                # ── Decrypt platform signature to get real access_id/key ─────
+                #
+                # The MQTT broker authenticates with the *decrypted* access_id
+                # (not the raw "mearicloud" value from the login response).
+                # Key derivation: base64(userID + PARTNER_ID + TTID + expireTime)[:16]
+                PARTNER_ID = "8"
+                TTID = "a"
 
-            if plat_sig and expire_time:
-                try:
-                    key_raw = f"{user_id}{PARTNER_ID}{TTID}{expire_time}"
-                    key16 = base64.b64encode(key_raw.encode()).decode().rstrip("=")[:16]
-                    decrypted = self._aes_cbc_decrypt(plat_sig, key16)
-                    info_b64 = decrypted.split("-")[0]
-                    pad = 4 - len(info_b64) % 4 if len(info_b64) % 4 else 0
-                    info_json = base64.b64decode(info_b64 + "=" * pad).decode()
-                    info = json.loads(info_json)
-                    access_id = info.get("accessid", "")
-                    access_key = info.get("accesskey", "")
-                    self._log(f"Decrypted MQTT access_id: {access_id[:12]}...")
-                except Exception as exc:
-                    self._log(f"Platform signature decryption failed: {exc}")
+                access_id = ""
+                access_key = ""
+                platform = pf.get("platform", {})
+                plat_sig = platform.get("signature", "")
+                expire_time = str(platform.get("expireTime", ""))
 
-            if access_id and access_key:
+                if plat_sig and expire_time:
+                    try:
+                        key_raw = f"{user_id}{PARTNER_ID}{TTID}{expire_time}"
+                        key16 = base64.b64encode(key_raw.encode()).decode().rstrip("=")[:16]
+                        decrypted = self._aes_cbc_decrypt(plat_sig, key16)
+                        info_b64 = decrypted.split("-")[0]
+                        pad = 4 - len(info_b64) % 4 if len(info_b64) % 4 else 0
+                        info_json = base64.b64decode(info_b64 + "=" * pad).decode()
+                        info = json.loads(info_json)
+                        access_id = info.get("accessid", "")
+                        access_key = info.get("accesskey", "")
+                        self._log("Platform credentials decrypted")
+                    except Exception as exc:
+                        self._log(f"Platform signature decryption failed: {exc}")
+
+                if not (access_id and access_key):
+                    # Do not overwrite a usable config of this same session
+                    # with empty credentials. Credentials known to be expired
+                    # belong to a dead platform session: drop them so the
+                    # next authenticate() refetches instead of half-working.
+                    existing = self.session_data.get("mqtt") or {}
+                    expired = (
+                        self.session_data.get("iotCredentialsExpireTime", 0)
+                        <= time.time()
+                    )
+                    if expired or not existing.get("mqtt_access_id"):
+                        self.session_data.pop("mqtt", None)
+                    self._log("MQTT credentials unavailable after platform fetch")
+                    return
+
                 self.session_data["iotPlatformKeys"] = {
                     **self.session_data.get("iotPlatformKeys", {}),
                     "accessid": access_id,
@@ -1141,23 +1382,29 @@ class CloudEdgeClient:
                 self.session_data["iotCredentialsFromPlatform"] = True
                 self.session_data["iotCredentialsExpireTime"] = int(expire_time) / 1000
 
-            mqtt_cfg = pf.get("mqtt", {})
-            self.session_data["mqtt"] = {
-                "mqtt_host": mqtt_cfg.get("host", ""),
-                "mqtt_port": int(mqtt_cfg.get("port", 1883)),
-                "mqtt_signature": pf.get("mqttSignature", ""),
-                "mqtt_access_id": access_id,
-                "mqtt_access_key": access_key,
-            }
-            self._log(
-                f"MQTT config: {self.session_data['mqtt']['mqtt_host']}"
-                f":{self.session_data['mqtt']['mqtt_port']}"
-            )
-        except Exception as exc:
-            self._log(f"Failed to fetch IoT config: {exc}")
+                mqtt_cfg = pf.get("mqtt", {})
+                self.session_data["mqtt"] = {
+                    "mqtt_host": mqtt_cfg.get("host", ""),
+                    "mqtt_port": int(mqtt_cfg.get("port", 1883)),
+                    "mqtt_signature": pf.get("mqttSignature", ""),
+                    "mqtt_access_id": access_id,
+                    "mqtt_access_key": access_key,
+                }
+                self._log(
+                    f"MQTT config: {self.session_data['mqtt']['mqtt_host']}"
+                    f":{self.session_data['mqtt']['mqtt_port']}"
+                )
+            except Exception as exc:
+                self._log(f"Failed to fetch IoT config: {_safe_exception_text(exc)}")
 
     def get_mqtt_config(self) -> Optional[Dict[str, Any]]:
         """Return MQTT connection parameters, or ``None`` if unavailable.
+
+        A configuration is only returned when it is actually usable: host,
+        username (``mqtt_access_id``) and password (``mqtt_signature``) must
+        all be present. Callers must treat ``None`` as "MQTT unavailable"
+        and retry on a later refresh, never start a listener with blank
+        credentials.
 
         The returned dict contains:
 
@@ -1169,15 +1416,36 @@ class CloudEdgeClient:
 
         Call :meth:`authenticate` first.
         """
-        if not self.session_data:
-            return None
-        mqtt = self.session_data.get("mqtt")
-        if not mqtt or not mqtt.get("mqtt_host"):
-            return None
-        return {
-            **mqtt,
-            "user_id": self.session_data.get("userID"),
-        }
+        with self._state_lock:
+            if not self.session_data:
+                return None
+            expiry = self.session_data.get("iotCredentialsExpireTime")
+            if expiry is not None and expiry <= time.time():
+                return None
+            mqtt = self.session_data.get("mqtt")
+            if not mqtt or not mqtt.get("mqtt_host"):
+                return None
+            if not mqtt.get("mqtt_access_id") or not mqtt.get("mqtt_signature"):
+                return None
+            return {
+                **mqtt,
+                "user_id": self.session_data.get("userID"),
+            }
+
+    @_serialized
+    def refresh_mqtt_config(self) -> Optional[Dict[str, Any]]:
+        """Recover unavailable/expired MQTT credentials without a new login.
+
+        At most one platform fetch per 60 seconds (including failed attempts).
+        Call from a worker: unlike get_mqtt_config(), this may perform I/O.
+        """
+        config = self.get_mqtt_config()
+        if config or not self.session_data:
+            return config
+        if time.monotonic() - self._last_iot_config_fetch >= _MQTT_REFRESH_THROTTLE:
+            self._fetch_iot_config(force_refresh=True)
+            self._save_session_cache(self.session_data)
+        return self.get_mqtt_config()
 
     def _generate_device_body(self, extra_params: Optional[Dict] = None) -> Dict:
         """Generate device body for API requests."""
@@ -1200,6 +1468,7 @@ class CloudEdgeClient:
             
         return body
     
+    @_serialized
     def get_homes(self) -> List[Dict]:
         """
         Get list of homes associated with the account.
@@ -1248,8 +1517,6 @@ class CloudEdgeClient:
             response = self._make_request('GET', url, headers=headers, timeout=DEFAULT_TIMEOUT)
             response_data = response.json()
             
-            # Log the actual response for debugging
-            self._log(f"Homes API response: {response_data}")
             result_code = response_data.get("resultCode")
             self._log(f"Result code: {result_code}, type: {type(result_code)}")
             
@@ -1275,7 +1542,7 @@ class CloudEdgeClient:
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
-                self._log(f"API error - Code: {error_code}, Message: {error_msg}, Full response: {response_data}")
+                self._log(f"API error - Code: {error_code}, Message: {error_msg}")
                 if str(error_code) in SESSION_INVALID_RESULT_CODES:
                     # The server rejected our token (e.g. the account was
                     # logged in elsewhere — one active session per account).
@@ -1286,24 +1553,31 @@ class CloudEdgeClient:
                     )
                 raise CloudEdgeError(
                     f"Failed to retrieve homes: {error_msg} (Code: {error_code})",
-                    details={"error_code": error_code, "message": error_msg, "response": response_data}
+                    details={"error_code": error_code, "message": error_msg}
                 )
-                
+
         except requests.exceptions.RequestException as e:
-            raise NetworkError(f"Home list request failed: {e}")
+            raise NetworkError(
+                f"Home list request failed: {_sanitize_request_exception(e)}"
+            ) from None
         except json.JSONDecodeError:
             raise CloudEdgeError("Failed to parse home list response")
             
-    def get_devices_by_home(self, home_id: str) -> List[Dict]:
+    @_serialized
+    def get_devices_by_home(self, home_id: str, enhance: bool = True) -> List[Dict]:
         """
         Get list of devices in a specific home.
-        
+
         Args:
             home_id (str): Home ID to get devices from
-            
+            enhance (bool): Apply ping-based status enhancement. Internal
+                token refreshes pass ``False`` because the enhancement
+                itself needs the OpenAPI tokens this inventory mints
+                (see :meth:`_refresh_device_tokens`).
+
         Returns:
             List[Dict]: List of device information dictionaries
-            
+
         Raises:
             AuthenticationError: If not authenticated
             NetworkError: If network request fails
@@ -1372,10 +1646,11 @@ class CloudEdgeClient:
                                     **_extract_app_streaming_metadata(device),
                                 }
                                 self._remember_device_token(device)
-                                
+
                                 # Get enhanced online status
-                                device_dict['online'] = self._get_enhanced_device_status(device_dict)
-                                
+                                if enhance:
+                                    device_dict['online'] = self._get_enhanced_device_status(device_dict)
+
                                 devices.append(device_dict)
                                 
                 return devices
@@ -1392,7 +1667,9 @@ class CloudEdgeClient:
                 )
                 
         except requests.exceptions.RequestException as e:
-            raise NetworkError(f"Home device list request failed: {e}")
+            raise NetworkError(
+                f"Home device list request failed: {_sanitize_request_exception(e)}"
+            ) from None
         except json.JSONDecodeError:
             raise CloudEdgeError("Failed to parse home device list response")
             
@@ -1445,17 +1722,21 @@ class CloudEdgeClient:
         if home_id:
             return self.get_devices_by_home(home_id)
 
-        return self._collect_all_devices()
+        return self._collect_all_devices(enhance=True)
 
-    def _collect_all_devices(self) -> List[Dict]:
+    @_serialized
+    def _collect_all_devices(self, enhance: bool = True) -> List[Dict]:
         """Merge the per-home and owned-device inventories.
 
         Never returns a partial inventory: a caller that drops devices it
         cannot see (Home Assistant removes their entities and stops their
-        streams) must not act on a transient API failure. The owned-device
-        endpoint is the one exception — once the homes answered, a failure
-        there is logged instead of raised, so a legacy endpoint going away
-        cannot take the whole inventory down with it.
+        streams) must not act on a transient API failure. Transient
+        transport failures (:class:`NetworkError`) therefore propagate even
+        when one inventory already answered. The owned-device endpoint is
+        the one exception: once the homes answered, a *permanent-looking*
+        failure there (endpoint removed, unparseable response) is logged
+        instead of raised, so a legacy endpoint going away cannot take the
+        whole inventory down with it.
         """
         devices: List[Dict] = []
         seen = set()
@@ -1472,8 +1753,11 @@ class CloudEdgeClient:
         self._log(f"Collecting devices from {len(homes)} home(s)")
         for home in homes:
             try:
-                _add(self.get_devices_by_home(home['home_id']))
+                _add(self.get_devices_by_home(home['home_id'], enhance=enhance))
             except AuthenticationError:
+                raise
+            except (NetworkError, RateLimitError):
+                # Transient: fail the refresh rather than risk a partial list.
                 raise
             except Exception as e:
                 raise CloudEdgeError(
@@ -1481,8 +1765,13 @@ class CloudEdgeClient:
                 ) from e
 
         try:
-            _add(self._get_owned_devices())
+            _add(self._get_owned_devices(enhance=enhance))
         except AuthenticationError:
+            raise
+        except (NetworkError, RateLimitError):
+            # A transient failure must not present a partial inventory as
+            # complete: consumers would drop the devices they cannot see.
+            # Fail the refresh so callers keep their previous data.
             raise
         except Exception as e:
             if not devices:
@@ -1492,8 +1781,13 @@ class CloudEdgeClient:
         self._log(f"Collected {len(devices)} device(s) in total")
         return devices
 
-    def _get_owned_devices(self) -> List[Dict]:
-        """Devices the account owns, via the legacy ``getDevice.action`` API."""
+    @_serialized
+    def _get_owned_devices(self, enhance: bool = True) -> List[Dict]:
+        """Devices the account owns, via the legacy ``getDevice.action`` API.
+
+        ``enhance=False`` skips the ping-based status enrichment (used by
+        :meth:`_refresh_device_tokens`, whose enrichment would recurse).
+        """
         if not self.session_data:
             raise AuthenticationError("Not authenticated - call authenticate() first")
 
@@ -1551,7 +1845,8 @@ class CloudEdgeClient:
                             **_extract_app_streaming_metadata(device),
                         }
                         self._remember_device_token(device)
-                        device_dict['online'] = self._get_enhanced_device_status(device_dict)
+                        if enhance:
+                            device_dict['online'] = self._get_enhanced_device_status(device_dict)
                         standardized_devices.append(device_dict)
 
                 # Older API fallback: devices under result.deviceList
@@ -1575,7 +1870,8 @@ class CloudEdgeClient:
                                 **_extract_app_streaming_metadata(device),
                             }
                             self._remember_device_token(device)
-                            device_dict['online'] = self._get_enhanced_device_status(device_dict)
+                            if enhance:
+                                device_dict['online'] = self._get_enhanced_device_status(device_dict)
                             standardized_devices.append(device_dict)
 
                 return standardized_devices
@@ -1592,23 +1888,29 @@ class CloudEdgeClient:
                 )
                 
         except requests.exceptions.RequestException as e:
-            raise NetworkError(f"Device list request failed: {e}")
+            raise NetworkError(
+                f"Device list request failed: {_sanitize_request_exception(e)}"
+            ) from None
         except json.JSONDecodeError:
             raise CloudEdgeError("Failed to parse device list response")
             
-    def get_device_status(self, device_id: str) -> Optional[Dict]:
+    @_serialized
+    def get_device_status(self, device_id: str) -> Dict:
         """
         Get online status for a specific device.
-        
+
         Args:
             device_id (str): Device ID
-            
+
         Returns:
-            Optional[Dict]: Device status information or None if failed
-            
+            Dict: Device status information (``online``, ``last_seen``).
+                Never returns ``None``: failures raise.
+
         Raises:
             AuthenticationError: If not authenticated
             NetworkError: If network request fails
+            CloudEdgeError: If the API rejects the request or the response
+                cannot be parsed
         """
         if not self.session_data:
             raise AuthenticationError("Not authenticated - call authenticate() first")
@@ -1650,10 +1952,13 @@ class CloudEdgeClient:
                 )
                 
         except requests.exceptions.RequestException as e:
-            raise NetworkError(f"Device status request failed: {e}")
+            raise NetworkError(
+                f"Device status request failed: {_sanitize_request_exception(e)}"
+            ) from None
         except json.JSONDecodeError:
             raise CloudEdgeError("Failed to parse device status response")
 
+    @_serialized
     def get_device_online_status(self, serial_number: str) -> str:
         """Query the precise online state of a device via OpenAPI.
 
@@ -1707,10 +2012,13 @@ class CloudEdgeClient:
             self._log(f"Device {serial_number} online status: {status}")
             return status
         except requests.exceptions.RequestException as e:
-            raise NetworkError(f"Device status request failed: {e}")
+            raise NetworkError(
+                f"Device status request failed: {_sanitize_request_exception(e)}"
+            ) from None
         except json.JSONDecodeError:
             raise CloudEdgeError("Failed to parse device status response")
 
+    @_serialized
     def wake_device(
         self,
         serial_number: str,
@@ -1790,7 +2098,7 @@ class CloudEdgeClient:
                     self._log(f"Bell wake sent for device_id={device_id}")
                     success = True
             except Exception as e:
-                self._log(f"Bell wake failed: {e}")
+                self._log(f"Bell wake failed: {_safe_exception_text(e)}")
 
         if not success:
             self._log(
@@ -1816,22 +2124,40 @@ class CloudEdgeClient:
 
         Returns:
             bool: ``True`` if the camera came online within *timeout* seconds.
+
+        Rate limiting is respected: a 429 from the status endpoint backs
+        off up to the server-provided ``Retry-After`` (bounded by the
+        remaining wait budget) instead of hammering the endpoint.
+
+        HTTP timeouts, retries and lock acquisition use the remaining budget.
+        Requests cannot strictly bound DNS resolution or a trickling response.
+        AuthenticationError is propagated rather than repeatedly polling.
         """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             try:
-                status = self.get_device_online_status(serial_number)
-                if status == DEVICE_STATUS_ONLINE:
+                with self._request_budget(deadline):
+                    status = self.get_device_online_status(serial_number)
+                if status == DEVICE_STATUS_ONLINE and time.monotonic() < deadline:
                     self._log(f"Device {serial_number} is now online")
                     return True
                 self._log(
                     f"Device {serial_number} status={status}, "
-                    f"waiting ({deadline - time.time():.0f}s left)..."
+                    f"waiting ({deadline - time.monotonic():.0f}s left)..."
                 )
+            except RateLimitError as e:
+                remaining = max(0.0, deadline - time.monotonic())
+                backoff = min(e.retry_after or poll_interval, remaining)
+                if backoff > 0:
+                    self._log(f"Status check rate limited; backing off {backoff:.0f}s")
+                    time.sleep(backoff)
+                continue
+            except AuthenticationError:
+                raise
             except Exception as e:
-                self._log(f"Status check error: {e}")
+                self._log(f"Status check error: {_safe_exception_text(e)}")
 
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(poll_interval, remaining))
 
@@ -1902,8 +2228,9 @@ class CloudEdgeClient:
         )
         return False
 
-    def get_device_config(self, device_serial: str, 
-                          parameter_codes: Optional[List[str]] = None) -> Optional[Dict]:
+    @_serialized
+    def get_device_config(self, device_serial: str,
+                          parameter_codes: Optional[List[str]] = None) -> Dict:
         """
         Get device configuration parameters.
         
@@ -1912,11 +2239,13 @@ class CloudEdgeClient:
             parameter_codes (Optional[List[str]]): Specific parameter codes to retrieve
             
         Returns:
-            Optional[Dict]: Device configuration data or None if failed
+            Dict: Device configuration data. Failures raise; never returns None.
             
         Raises:
             AuthenticationError: If not authenticated
             ConfigurationError: If configuration retrieval fails
+            NetworkError: If the HTTP request fails.
+            RateLimitError: If the server requests a retry later.
         """
         if not self.session_data:
             raise AuthenticationError("Not authenticated - call authenticate() first")
@@ -1973,7 +2302,7 @@ class CloudEdgeClient:
                 raise ConfigurationError(f"Config request failed: {response.status_code}")
                 
         except requests.exceptions.RequestException as e:
-            raise NetworkError(f"Config request failed: {e}")
+            raise NetworkError(f"Config request failed: {_sanitize_request_exception(e)}") from None
         except json.JSONDecodeError as e:
             raise ConfigurationError(f"Failed to parse config response: {e}")
             
@@ -2029,6 +2358,13 @@ class CloudEdgeClient:
                     details={"device_serial": device_serial},
                 )
 
+        return self._set_device_config(device_serial, parameters)
+
+    @_serialized
+    def _set_device_config(self, device_serial: str, parameters: Dict[str, Any]) -> bool:
+        """Send the command atomically; the optional wake wait runs unlocked."""
+        if not self.session_data:
+            raise AuthenticationError("Not authenticated - call authenticate() first")
         self._log(f"Setting device configuration for SN: {device_serial}")
         
         # Check if we have OpenAPI credentials
@@ -2088,7 +2424,7 @@ class CloudEdgeClient:
                 raise ConfigurationError(f"Set config request failed: {response.status_code}")
                 
         except requests.exceptions.RequestException as e:
-            raise NetworkError(f"Set config request failed: {e}")
+            raise NetworkError(f"Set config request failed: {_sanitize_request_exception(e)}") from None
         except json.JSONDecodeError as e:
             raise ConfigurationError(f"Failed to parse set config response: {e}")
             
@@ -2166,7 +2502,7 @@ class CloudEdgeClient:
 
         return success
         
-    def get_device_info(self, device_name: str, include_config: bool = True) -> Optional[Dict]:
+    def get_device_info(self, device_name: str, include_config: bool = True) -> Dict:
         """
         Get comprehensive device information including status and configuration.
         
@@ -2175,10 +2511,11 @@ class CloudEdgeClient:
             include_config (bool): Whether to include device configuration
             
         Returns:
-            Optional[Dict]: Complete device information or None if not found
+            Dict: Device information; optional configuration may be unavailable.
             
         Raises:
             DeviceNotFoundError: If device not found
+            CloudEdgeError: If inventory or status retrieval fails.
         """
         # Find device
         device = self.find_device_by_name(device_name)

@@ -49,12 +49,44 @@ pip install -e .[examples,dev]
 
 ### Dependencies
 
+Python **3.10+** is required.
+
 The library requires:
 - **requests** (≥2.25.0) - For HTTP API communication
 - **cryptography** (≥3.4.0) - For credential encryption
+- **pycryptodome** (≥3.15.0) - For response decryption
 
 Optional dependencies:
 - **python-dotenv** (≥0.19.0) - For loading environment variables in examples
+- **paho-mqtt** (≥2.0.0) - For the MQTT push-event listener (`pip install pycloudedge[mqtt]`)
+
+### Operational contract
+
+- **Thread safety**: one `CloudEdgeClient` may be shared across threads (the
+  Home Assistant integration calls it from multiple executor threads);
+  authentication, inventory and OpenAPI operations are serialized internally. The
+  internal lock is never held while sleeping in wake-polling loops.
+  Callers must not mutate `session_data` or the internal HTTP session.
+- **Session cache**: the cache file is bound to the account (username +
+  region) that wrote it; another account on the same path cannot adopt the
+  token. Legacy caches without identity are invalidated on load.
+- **Error taxonomy**: rejected credentials raise `AuthenticationError`,
+  transport failures raise `NetworkError`, rate limiting raises
+  `RateLimitError` (with the server's `Retry-After` hint in seconds, when
+  provided). Direct requests raise immediately; wake polling waits only
+  within its remaining budget. Error messages never
+  include signed URLs or response bodies.
+- **MQTT recovery**: `get_mqtt_config()` is a read-only snapshot;
+  `refresh_mqtt_config()` may fetch missing/expired platform credentials,
+  at most once per minute. Run it in a worker and retry on later refreshes
+  if it returns `None`; no new account login is needed.
+- **Wake deadlines**: `wait_for_online()` shares its remaining monotonic
+  budget across HTTP timeouts, retries, token discovery and lock waits.
+  Requests cannot strictly bound DNS resolution or trickling response bodies.
+  Authentication failures propagate immediately.
+- **Transient inventory failures fail the refresh**: `get_devices()` raises
+  rather than returning a partial inventory, so callers never mistake a
+  network blip for removed devices.
 
 ## Quick Start
 

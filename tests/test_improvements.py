@@ -375,10 +375,14 @@ def test_session_cache_is_private_and_atomic(tmp_path):
 
     client._save_session_cache({"userToken": "secret", "loginTime": 1})
 
-    assert json.loads(cache_path.read_text()) == {
-        "userToken": "secret",
-        "loginTime": 1,
+    stored = json.loads(cache_path.read_text())
+    assert stored["userToken"] == "secret"
+    assert stored["loginTime"] == 1
+    # The entry carries the account identity and never the password.
+    assert stored["_cache_identity"] == {
+        "version": 2, "username": "user@example.com", "country_code": "US",
     }
+    assert "password" not in stored
     assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
     assert list(tmp_path.glob(".session.json.*.tmp")) == []
 

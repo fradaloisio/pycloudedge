@@ -11,6 +11,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+dist-staging/
 downloads/
 eggs/
 .eggs/
@@ -122,3 +123,5 @@ cloudedge/_version.py
 .home_id
 
 publish.sh
+docs
+test_3region_login.py

@@ -120,6 +120,51 @@ def test_gap_skip_discards_damaged_fragmented_message():
     ) == ("data", b"clean-message")
 
 
+def _pack_kcp_push(sn, data):
+    """Hand-pack one single-fragment KCP PUSH segment (24-byte header).
+
+    Built from the documented wire format instead of the library's own
+    encoder so the input frames are independent of the code under test.
+    """
+    return struct.pack(
+        "<IBBHIIII",
+        0x0C,  # conv
+        81,    # cmd PUSH
+        0,     # frg: last/only fragment
+        32,    # wnd
+        0,     # ts
+        sn,
+        0,     # una
+        len(data),
+    ) + data
+
+
+def test_delivery_order_gap_then_compound_datagram():
+    tunnel = KcpTunnel(lambda data: None)
+    delivered = []
+
+    def receive(datagram):
+        # Consumer contract: the process_input() return value is handled
+        # first, then the queue is drained via poll_data().
+        result = tunnel.process_input(datagram)
+        if result and result[0] == "data":
+            delivered.append(result[1])
+        while True:
+            message = tunnel.poll_data()
+            if message is None:
+                break
+            delivered.append(message)
+
+    receive(_pack_kcp_push(0, b"initial"))
+    # Out-of-order segment buffered behind the gap at sn1/sn2.
+    receive(_pack_kcp_push(3, b"C"))
+    # One datagram carrying both gap-filling segments: sn1 completes A
+    # immediately, sn2 completes B and releases the buffered C.
+    receive(_pack_kcp_push(1, b"A") + _pack_kcp_push(2, b"B"))
+
+    assert delivered == [b"initial", b"A", b"B", b"C"]
+
+
 def test_advertised_window_matches_android_client_capture():
     segment = parse_kcp_segment(build_kcp_segment(KCP_CMD_ACK, sn=1))
 

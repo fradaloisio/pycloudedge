@@ -30,6 +30,7 @@ from .meari_signaling import MsgSvrClient
 from .root_discovery import discover_msgsvr_endpoints
 from .turn_client import (
     TurnClient,
+    TurnRenewalRefusedError,
     _build_xts_ice_binding_request,
     _parse_stun,
     _build_stun,
@@ -202,6 +203,16 @@ def _recv_udp_batch(turn, timeout: float, limit: int = 2000):
 
 
 def _get_local_ips() -> list[str]:
+    # Behind a NAT'd container runtime (Colima/Docker Desktop on macOS, some
+    # podman/k8s setups) the interface IP is a VM-internal address that the
+    # camera cannot route to, while outbound packets leave with the host's LAN
+    # IP. Cameras run a strict ICE source check and silently drop traffic from
+    # addresses that were not advertised in the SDP offer, so the direct path
+    # never confirms and the session dies on the relay bootstrap. Advertising
+    # the effective source IP fixes LAN-direct streaming from those hosts.
+    advertise = os.environ.get("CLOUDEDGE_P2P_ADVERTISE_IP", "").strip()
+    if advertise:
+        return [part.strip() for part in advertise.split(",") if part.strip()]
     ips: list[str] = []
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
@@ -822,21 +833,23 @@ class P2PStreamer:
         coturn_user = coturn.get("username", "")
         coturn_pwd = coturn.get("pwd", "")
 
-        # Allocate TURN relay
+        # Allocate TURN relay.  The try/finally starts at the first acquired
+        # resource (turn.connect() opens both UDP sockets) so a failure in
+        # allocate(), peer_stun_binding() or the streaming loop itself can
+        # never leak the sockets to the garbage collector.
         turn = TurnClient(coturn_ip, coturn_port, coturn_user, coturn_pwd)
-        turn.connect()
-        if not turn.allocate():
-            _LOGGER.error("TURN allocation failed")
-            turn.close()
-            return (0, 0)
-        if not remote and not turn.peer_stun_binding():
-            _LOGGER.warning(
-                "Could not discover the dedicated media socket's public mapping; "
-                "continuing with host and TURN paths"
-            )
-
         self._active_vvp_session = None
         try:
+            turn.connect()
+            if not turn.allocate():
+                _LOGGER.error("TURN allocation failed")
+                return (0, 0)
+            if not remote and not turn.peer_stun_binding():
+                _LOGGER.warning(
+                    "Could not discover the dedicated media socket's public "
+                    "mapping; continuing with host and TURN paths"
+                )
+
             return self._stream_with_turn(
                 sig,
                 turn,
@@ -985,7 +998,12 @@ class P2PStreamer:
         turn.drain_socket()
         for c in camera_candidates:
             turn.channel_bind(c["ip"], c["port"])
-        turn.refresh()
+        try:
+            turn.refresh()
+        except TurnRenewalRefusedError as exc:
+            # One-off during setup; if the server keeps refusing, the
+            # periodic renewal in the streaming loops ends the session.
+            _LOGGER.debug("Initial TURN refresh refused: %s", exc)
 
         # Send candidate_complete
         cand_resp = sig.send_candidate_complete(device_uuid)
@@ -1093,7 +1111,7 @@ class P2PStreamer:
         login_resend_at = time.time() + 2
         heartbeat_at = time.time() + 3
         iva_heartbeat_at = time.time() + 3
-        turn_refresh_at = time.time() + 60
+        turn_renewal_at = time.time() + 60
         stun_keepalive_at = time.time() + 5
 
         ice_count = 0
@@ -1212,12 +1230,20 @@ class P2PStreamer:
                 kcp.send_handshake()
                 iva_heartbeat_at = now + 3
 
-            if login_ok and now >= turn_refresh_at:
+            if login_ok and now >= turn_renewal_at:
                 try:
-                    turn.refresh(lifetime=600)
+                    # Renews the allocation, permissions (300 s) and channel
+                    # bindings (600 s) that are due — RFC 8656 §9/§12.
+                    turn_renewal_at = now + turn.renew_due()
+                except TurnRenewalRefusedError as exc:
+                    _LOGGER.warning(
+                        "TURN refused a session renewal (%s); ending P2P "
+                        "session so the caller can rebuild it",
+                        exc,
+                    )
+                    return (stream_video_count, stream_total_bytes)
                 except Exception:
-                    pass
-                turn_refresh_at = now + 60
+                    turn_renewal_at = now + 5
 
             if not login_ok and now >= stun_keepalive_at:
                 try:
@@ -1540,7 +1566,7 @@ class P2PStreamer:
         vvp_seq = vvp_seq_start
         last_heartbeat = time.time()
         last_iva_heartbeat = time.time()
-        last_turn_refresh = time.time()
+        turn_renewal_at = time.time() + 60
 
         def _process_kcp_message(msg_data):
             nonlocal frame_count, video_frame_count, total_bytes, last_video_time
@@ -1605,6 +1631,24 @@ class P2PStreamer:
         timeout_count = 0
 
         while self._running:
+            # TURN renewals must run every pass, not only when the receive
+            # buffer happens to be empty: continuous packet flow used to
+            # starve them until the allocation, permissions and channel
+            # bindings expired (RFC 8656 §9/§12).
+            now = time.time()
+            if now >= turn_renewal_at:
+                try:
+                    turn_renewal_at = now + turn.renew_due()
+                except TurnRenewalRefusedError as exc:
+                    _LOGGER.warning(
+                        "TURN refused a session renewal (%s); ending P2P "
+                        "session so the caller can rebuild it",
+                        exc,
+                    )
+                    return (video_frame_count, total_bytes)
+                except Exception:
+                    turn_renewal_at = now + 5
+
             if not _recv_buf:
                 kcp.flush_acks()
                 _recv_buf.extend(_recv_udp_batch(turn, 0.5))
@@ -1625,12 +1669,6 @@ class P2PStreamer:
                     if now - last_iva_heartbeat >= 3:
                         kcp.send_handshake()
                         last_iva_heartbeat = now
-                    if now - last_turn_refresh > 60:
-                        try:
-                            turn.refresh(lifetime=600)
-                        except Exception:
-                            pass
-                        last_turn_refresh = now
                     if (
                         now - start_time > 10
                         and video_frame_count == 0

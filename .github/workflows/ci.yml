@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Aligned with requires-python (>=3.10): oldest supported and the
+        # version Home Assistant currently requires.
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # setuptools_scm derives the version from tags
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pycryptodome build
+      - name: Run tests
+        run: python -m pytest tests/ -p no:cacheprovider -o addopts='' -q
+      - name: Build and test the installed artifact
+        run: |
+          python -m build
+          python -m pip install --no-deps --force-reinstall dist/*.whl
+          cp -R tests "$RUNNER_TEMP/pycloudedge-artifact-tests"
+          cd "$RUNNER_TEMP"
+          python -m pytest pycloudedge-artifact-tests -p no:cacheprovider -o addopts='' -q

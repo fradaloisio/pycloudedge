@@ -133,16 +133,40 @@ def test_device_entry_without_signature_is_ignored(client):
     assert client._device_tokens == {}
 
 
-def test_missing_token_triggers_a_device_list_refresh(client):
-    """A caller may set a parameter before anything listed the devices."""
-    def refresh():
-        client._device_tokens['0000000123456789'] = {'token': 'fresh', 't': '1'}
-    client.get_devices = Mock(side_effect=refresh)
-    client._make_request = Mock(return_value=response({'iot': {}}))
+def test_missing_token_triggers_a_plain_device_list_refresh(client):
+    """A caller may set a parameter before anything listed the devices.
+
+    The refresh must walk the *plain* inventory (homes + owned, no ping
+    enhancement and no OpenAPI reads) so a device the cloud lists without
+    a signature cannot recurse; and it must mint the token through the
+    real parsing of the listing response.
+    """
+    calls = []
+
+    def transport(method, url, **kwargs):
+        base = url.split("?")[0]
+        calls.append(url)
+        if base.endswith("/v1/app/home/list"):
+            return response({"resultCode": "1001", "result": {"homes": []}})
+        if base.endswith("/ppstrongs/getDevice.action"):
+            return response({"resultCode": "1001", "ipc": [{
+                "deviceID": 104695450,
+                "snNum": "ppsl0000000123456789",
+                "deviceName": "Cam",
+                "onLine": 1,
+                "deviceSignature": "fresh",
+                "t": 1789766455,
+            }]})
+        return response({"iot": {}})
+
+    client._make_request = Mock(side_effect=transport)
 
     client.get_device_config('123456789')
 
-    client.get_devices.assert_called_once()
+    # One inventory walk (homes + owned) then the config request: no
+    # recursion, bounded request count.
+    assert len(calls) == 3
+    assert calls[-1].endswith("/openapi/device/config")
     assert client._make_request.call_args.kwargs['params']['token'] == 'fresh'
 
 

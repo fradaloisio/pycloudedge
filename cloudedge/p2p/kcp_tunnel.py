@@ -438,6 +438,29 @@ class KcpTunnel:
 
         return messages
 
+    def _dequeue_delivery_result(self):
+        """Dequeue the oldest completed message as a process_input result.
+
+        recv_queue is the single ordered delivery path, so the queue head is
+        by construction the oldest undelivered message.  Surfacing it through
+        the return value keeps the "return value first, then poll_data()"
+        consumer pattern strictly sequence-ordered even when one datagram
+        fills a gap and releases several messages at once.
+        """
+        if not self.recv_queue:
+            return None
+        data = self.recv_queue.pop(0)
+        if len(data) >= IVA_FRAME_SIZE and data.startswith(IVA_MAGIC):
+            iva = parse_iva_frame(data)
+            if not iva:
+                return None
+            type_marker, id1, id2, payload = iva
+            if type_marker == IVA_TYPE_HANDSHAKE:
+                return ("handshake", (id1, id2))
+            if type_marker == IVA_TYPE_DATA:
+                return ("data", payload)
+        return ("data", data)
+
     def _process_kcp_segment(self, seg):
         """Process one already validated KCP segment."""
         cmd = seg["cmd"]
@@ -461,24 +484,21 @@ class KcpTunnel:
             if not messages:
                 return ("fragment", seg["data"])
 
-            for message in messages[1:]:
+            # Centralized ordering: every completed message enters recv_queue
+            # in sequence order.  process_input() hands the queue head to the
+            # caller via its return value, so consumers that handle the
+            # return value first and then drain poll_data() always observe
+            # strict sequence order.
+            for message in messages:
                 self.recv_queue.append(message)
+                if len(message) >= IVA_FRAME_SIZE and message.startswith(IVA_MAGIC):
+                    iva = parse_iva_frame(message)
+                    if iva and iva[0] == IVA_TYPE_HANDSHAKE:
+                        self.handshake_done = True
+                        self.peer_id1 = iva[1]
+                        self.peer_id2 = iva[2]
 
-            data = messages[0]
-            if len(data) >= IVA_FRAME_SIZE and data.startswith(IVA_MAGIC):
-                iva = parse_iva_frame(data)
-                if not iva:
-                    return None
-                type_marker, id1, id2, payload = iva
-                if type_marker == IVA_TYPE_HANDSHAKE:
-                    self.handshake_done = True
-                    self.peer_id1 = id1
-                    self.peer_id2 = id2
-                    return ("handshake", (id1, id2))
-                if type_marker == IVA_TYPE_DATA:
-                    return ("data", payload)
-
-            return ("data", data)
+            return ("queued", None)
 
         if cmd == KCP_CMD_ACK:
             self.acked_sns.add(seg["sn"])
@@ -536,19 +556,20 @@ class KcpTunnel:
         primary_result = None
         control_result = None
         fragment_result = None
+        completed_messages = False
         for seg in segments:
             result = self._process_kcp_segment(seg)
             if not result:
                 continue
             kind = result[0]
-            if kind in ("data", "handshake"):
-                if primary_result is None:
-                    primary_result = result
-                elif kind == "data":
-                    self.recv_queue.append(result[1])
+            if kind == "queued":
+                completed_messages = True
             elif kind == "fragment":
                 fragment_result = result
             elif control_result is None:
                 control_result = result
+
+        if completed_messages:
+            primary_result = self._dequeue_delivery_result()
 
         return primary_result or control_result or fragment_result
