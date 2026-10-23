@@ -32,16 +32,18 @@ from .turn_client import (
     TurnClient,
     TurnRenewalRefusedError,
     _build_xts_ice_binding_request,
+    _check_integrity,
     _parse_stun,
     _build_stun,
     _decode_xor_address,
+    BINDING_INDICATION,
     BINDING_REQUEST,
     BINDING_RESPONSE,
     DATA_INDICATION,
     ATTR_DATA,
     ATTR_XOR_PEER_ADDRESS,
 )
-from .kcp_tunnel import KcpTunnel, parse_kcp_segment, parse_iva_frame
+from .kcp_tunnel import KcpTunnel, parse_kcp_segments, parse_iva_frame
 from ..client import CloudEdgeClient
 from ..stream_profiles import select_default_live_stream_id
 
@@ -67,13 +69,28 @@ STREAM_TYPE_PHOTO = 0xFE
 STREAM_ENCRYPT_KEY = b"!mearicloud2.0!"
 _SIGNAL_STATUS_RETRY_WINDOW = 20.0
 _SIGNAL_STATUS_RETRY_POLL = 1.0
-_KCP_GAP_NUDGE_DELAY = 0.2
 _KCP_GAP_SKIP_DELAY = 5.0
 _VIDEO_STALL_RESTART_DELAY = 8.0
 _VIDEO_STALL_RESTART_INTERVAL = 10.0
 # The Android client keeps the P2P session alive across observed 15-33 second
 # pauses. Allow the same recovery window before falling back to a reconnect.
 _VIDEO_STALL_END_SESSION = 35.0
+_FIRST_VIDEO_TIMEOUT = 30.0
+_KCP_RETRANSMIT_INTERVAL = 2.0
+# Session keepalives of the vendor app (traffic.pcap, app 6.2.8): a msgsvr
+# heartbeat every register-reply "hb" seconds (30), a routed webrtcsvr hello
+# about every 21 s and, once ICE nominated a direct peer, a bare STUN Binding
+# Indication to it 10 s later and then every 30 s (the camera does the same).
+_KEEPALIVE_ENV = "CLOUDEDGE_P2P_KEEPALIVE"
+_MSGSVR_HEARTBEAT_INTERVAL = 30.0
+_MSGSVR_HELLO_INTERVAL = 21.0
+_MSGSVR_DRAIN_INTERVAL = 1.0
+_ICE_KEEPALIVE_FIRST_DELAY = 10.0
+_ICE_KEEPALIVE_INTERVAL = 30.0
+# TURN renewal cadence: re-check every minute while media is direct, retry a
+# failed renewal attempt after 5 s.
+_TURN_RENEWAL_DEFER = 60.0
+_TURN_RENEWAL_RETRY = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +113,93 @@ def format_sn(sn: str) -> str:
     if len(sn) == 9:
         return "0000000" + sn
     return sn[4:]
+
+
+def _keepalive_enabled_from_env() -> bool:
+    """Session keepalives stay on unless CLOUDEDGE_P2P_KEEPALIVE disables them."""
+    value = os.environ.get(_KEEPALIVE_ENV, "").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+class _SessionKeepalive:
+    """Keepalives the vendor app sends while a live view is open (C93, C87).
+
+    Driven from the streaming loops' timers: the msgsvr registration
+    heartbeat and the routed hello go out on the signaling connection, whose
+    replies are then read without blocking (status pushes stay queued on the
+    client); the STUN Binding Indication goes to the nominated direct ICE
+    peer.  A signaling failure only stops the signaling keepalives: the media
+    session never depends on them.
+    """
+
+    def __init__(
+        self, sig: Any, *, registered_at: float, heartbeat_interval: Any = None
+    ) -> None:
+        try:
+            interval = float(heartbeat_interval)
+        except (TypeError, ValueError):
+            interval = _MSGSVR_HEARTBEAT_INTERVAL
+        if interval <= 0:
+            interval = _MSGSVR_HEARTBEAT_INTERVAL
+        self._sig = sig
+        self._registered_at = registered_at
+        self._heartbeat_interval = interval
+        self._heartbeat_at = registered_at + interval
+        self._hello_at = registered_at + _MSGSVR_HELLO_INTERVAL
+        self._drain_at = registered_at
+        self._signaling_alive = sig is not None
+        self._ice_keepalive_at: float | None = None
+
+    def tick(
+        self,
+        now: float,
+        turn: Any,
+        confirmed_peer: tuple[str, int, bool] | None,
+    ) -> None:
+        if self._signaling_alive:
+            try:
+                if now >= self._heartbeat_at:
+                    self._sig.send_heartbeat(runtime=now - self._registered_at)
+                    self._heartbeat_at = now + self._heartbeat_interval
+                if now >= self._hello_at:
+                    self._sig.send_hello()
+                    self._hello_at = now + _MSGSVR_HELLO_INTERVAL
+                if now >= self._drain_at:
+                    self._sig.drain_frames()
+                    self._drain_at = now + _MSGSVR_DRAIN_INTERVAL
+            except Exception as exc:
+                self._signaling_alive = False
+                _LOGGER.debug("msgsvr keepalives stopped: %s", exc)
+
+        if confirmed_peer is None or not confirmed_peer[2]:
+            return
+        if self._ice_keepalive_at is None:
+            self._ice_keepalive_at = now + _ICE_KEEPALIVE_FIRST_DELAY
+        elif now >= self._ice_keepalive_at:
+            indication, _ = _build_stun(BINDING_INDICATION, b"")
+            try:
+                turn.peer_sock.sendto(indication, confirmed_peer[:2])
+            except OSError:
+                pass
+            self._ice_keepalive_at = now + _ICE_KEEPALIVE_INTERVAL
+
+
+def _dormancy_reported(sig: Any, device_uuid: str) -> bool:
+    """Whether the latest msgsvr status for this camera is dormancy (C95).
+
+    A logout from the previous session can still put a battery camera to
+    sleep after it answered this offer: dormancy follows a logout by
+    1.3-4.7 s (app capture: one push came 235 ms after the answer).  Status
+    pushes are queued in ``sig.pending_status`` by the request reads and,
+    while the session keepalives run, by ``drain_frames()``.
+    """
+    # A wake can overtake the previous session's dormancy push. Preserve the
+    # queue for other status consumers, but never let an obsolete state
+    # cancel an attempt after the camera has reported itself online again.
+    for event in reversed(getattr(sig, "pending_status", ())):
+        if event.get("uuid") == device_uuid and event.get("status"):
+            return event["status"] == "dormancy"
+    return False
 
 
 def _is_private_ip(ip: str) -> bool:
@@ -121,6 +225,33 @@ def _is_direct_peer_path(
     return not remote and not via_turn and peer_ip != turn_server_ip
 
 
+def _next_turn_renewal(
+    turn: TurnClient,
+    confirmed_peer: tuple[str, int, bool] | None,
+    now: float,
+) -> float:
+    """Run the TURN renewals that are due and return the next deadline.
+
+    Direct media (C83): the vendor app releases TURN within seconds of the
+    first direct KCP.  Renewals are deferred instead, without deallocating
+    (the allocation simply expires on the server), so a TURN-only refusal or
+    outage cannot end a healthy direct session.  Relayed or not yet
+    confirmed media keeps renewing; the next deadline counts from after
+    renew_due() returns (C84), so transactions that blocked for seconds do
+    not leave the next renewal already overdue.  TurnRenewalRefusedError
+    propagates: a refused renewal ends relay sessions only.
+    """
+    if confirmed_peer is not None and confirmed_peer[2]:
+        return now + _TURN_RENEWAL_DEFER
+    try:
+        delay = turn.renew_due()
+    except TurnRenewalRefusedError:
+        raise
+    except Exception:
+        delay = _TURN_RENEWAL_RETRY
+    return time.monotonic() + delay
+
+
 def _send_kcp_datagram(
     turn: TurnClient,
     data: bytes,
@@ -128,16 +259,32 @@ def _send_kcp_datagram(
     target_addr: tuple[str, int],
     confirmed_peer: tuple[str, int, bool] | None,
 ) -> None:
-    """Send KCP on the Android-compatible bootstrap or confirmed media path."""
+    """Send KCP on the bootstrap or confirmed path, with XTS's relay trailer.
+
+    Direct media has no trailer. Relay peers strip one byte before their KCP
+    parser; omitting it truncates the handshake and they never acknowledge it.
+    """
     if confirmed_peer is None:
-        turn.send_to_peer(*target_addr, data)
+        turn.send_to_peer(*target_addr, data + b"\x00")
         return
 
     peer_ip, peer_port, is_direct = confirmed_peer
     if is_direct:
         turn.peer_sock.sendto(data, (peer_ip, peer_port))
     else:
-        turn.send_to_peer(peer_ip, peer_port, data)
+        turn.send_to_peer(peer_ip, peer_port, data + b"\x00")
+
+
+def _strip_relay_kcp_trailer(data: bytes) -> bytes:
+    """Remove XTS's extra relay byte only after a complete KCP datagram.
+
+    The Android relay capture includes this byte inside TURN's data length,
+    distinct from TURN alignment padding. Its value is not always zero.
+    Direct KCP and malformed datagrams must retain strict KCP validation.
+    """
+    if len(data) > 24 and parse_kcp_segments(data[:-1]):
+        return data[:-1]
+    return data
 
 
 def _build_xts_sdp_offer(
@@ -185,13 +332,17 @@ def _recv_udp_batch(turn, timeout: float, limit: int = 2000):
     sockets = [turn.sock]
     if turn.peer_sock is not None:
         sockets.append(turn.peer_sock)
-    ready, _, _ = select.select(sockets, [], [], timeout)
-    packets = []
+    packets = [(raw, addr, True) for raw, addr in turn.drain_pending_datagrams(limit)]
+    if len(packets) >= limit:
+        return packets
+    ready, _, _ = select.select(sockets, [], [], 0 if packets else timeout)
     for recv_sock in ready:
+        if len(packets) >= limit:
+            break
         previous_timeout = recv_sock.gettimeout()
         recv_sock.setblocking(False)
         try:
-            for _ in range(limit):
+            for _ in range(limit - len(packets)):
                 try:
                     raw, addr = recv_sock.recvfrom(65536)
                 except (BlockingIOError, OSError):
@@ -473,11 +624,106 @@ def _send_direct_ice_binding(
     local_ufrag: str,
     remote_ufrag: str,
     remote_pwd: str,
-) -> None:
+) -> bytes:
+    """Send an ICE check on the direct media socket; return its txn id."""
+    txn_id = os.urandom(12)
     msg = _build_xts_ice_binding_request(
-        local_ufrag, remote_ufrag, remote_pwd
+        local_ufrag, remote_ufrag, remote_pwd, txn_id
     )
     sock.sendto(msg, (peer_ip, peer_port))
+    return txn_id
+
+
+class _MediaSourceFilter:
+    """Accept media and ICE datagrams only from expected sources (C80).
+
+    Both P2P sockets are bound to every interface, so without this check any
+    host that reaches them could inject KCP (the stream key is a constant)
+    or move the confirmed media path to itself.
+
+    * TURN socket: only the TURN server.
+    * Direct media socket: the TURN server, the camera's advertised relay
+      candidates (exact address) and, as an explicit rule, any port of an
+      advertised host or srflx candidate IP or of the camera's WAN IP
+      reported by msgsvr: a camera behind a NAT, or one sending from another
+      socket, can use a port its candidate does not name.
+    * Any other source must prove it is the ICE peer first: a Binding
+      Request whose MESSAGE-INTEGRITY verifies with our ice-pwd (as every
+      camera check in the app capture does) or a Binding Response to one of
+      our own direct checks.  The source is trusted from then on
+      (peer-reflexive).
+
+    Everything else is dropped, counted and logged at debug level.
+    """
+
+    _MAX_CHECKS = 256
+    _MAX_LOGGED_SOURCES = 32
+
+    def __init__(
+        self,
+        turn: Any,
+        candidates: list[dict],
+        ice_pwd: str,
+        camera_wan_ip: str | None = None,
+    ) -> None:
+        self._turn_server = (turn.server_ip, turn.server_port)
+        self._ice_key = ice_pwd.encode()
+        self._trusted_addrs: set[tuple[str, int]] = {self._turn_server}
+        self._trusted_ips: set[str] = {camera_wan_ip} if camera_wan_ip else set()
+        self._checks: deque = deque(maxlen=self._MAX_CHECKS)
+        self._logged_sources: set[tuple[str, int]] = set()
+        self.dropped = 0
+        for candidate in candidates:
+            self.add_candidate(candidate)
+
+    def add_candidate(self, candidate: dict) -> None:
+        self._trusted_addrs.add((candidate["ip"], candidate["port"]))
+        if candidate.get("type") != "relay":
+            self._trusted_ips.add(candidate["ip"])
+
+    def remember_check(self, txn_id: bytes) -> None:
+        self._checks.append(txn_id)
+
+    def answers_our_check(self, message: dict) -> bool:
+        return message["txn_id"] in self._checks
+
+    def accept(self, raw: bytes, addr: tuple, from_turn_socket: bool) -> bool:
+        source = (addr[0], addr[1])
+        if from_turn_socket:
+            return source == self._turn_server or self._drop(source)
+        if source in self._trusted_addrs or source[0] in self._trusted_ips:
+            return True
+        message = _parse_stun(raw)
+        if message is not None and (
+            (
+                message["type"] == BINDING_REQUEST
+                and _check_integrity(raw, self._ice_key)
+            )
+            or (
+                message["type"] == BINDING_RESPONSE
+                and self.answers_our_check(message)
+            )
+        ):
+            _LOGGER.debug("ICE peer-reflexive source %s:%s", *source)
+            self._trusted_addrs.add(source)
+            return True
+        return self._drop(source)
+
+    def _drop(self, source: tuple[str, int]) -> bool:
+        self.dropped += 1
+        if (
+            source not in self._logged_sources
+            and len(self._logged_sources) < self._MAX_LOGGED_SOURCES
+        ):
+            self._logged_sources.add(source)
+            _LOGGER.debug(
+                "Dropped P2P datagram from unexpected source %s:%s "
+                "(%d dropped so far)",
+                source[0],
+                source[1],
+                self.dropped,
+            )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +739,21 @@ class P2PStreamer:
       on_audio(data: bytes)  — raw G.711 µ-law audio payload
       on_login()             — called when VVP login succeeds
       on_disconnect()        — called when session ends
+
+    ``manage_stream_switch`` (default ``False``) is a legacy opt-in that writes
+    IoT parameter 167 (``FRONT_LIGHT_SWITCH``, the camera's front light /
+    floodlight command) to 1 before a session and to 0 after it. Streaming does
+    not need it: the vendor app never writes 167 to start live view, and the
+    cameras stream the same live window without it. Enabling it turns the light
+    on and then forces it off, overwriting the user's own light setting.
+
+    ``keepalive`` sends the session keepalives of the vendor app: the msgsvr
+    registration heartbeat (cmd 0xC9, every register-reply ``hb`` seconds),
+    a routed webrtcsvr hello about every 21 s and, after ICE nomination, a
+    STUN Binding Indication to the direct peer every 30 s.  When not given
+    it is on unless the ``CLOUDEDGE_P2P_KEEPALIVE`` environment variable is
+    ``0``/``false``/``no``/``off``, so live A/B tests can switch it off
+    without code changes.
     """
 
     def __init__(
@@ -506,7 +767,8 @@ class P2PStreamer:
         on_disconnect: Callable[[], None] | None = None,
         remote: bool = False,
         video_id: int | None = None,
-        manage_stream_switch: bool = True,
+        manage_stream_switch: bool = False,
+        keepalive: bool | None = None,
     ) -> None:
         self._api = api
         self._device = device
@@ -527,6 +789,9 @@ class P2PStreamer:
             raise ValueError("video_id must be between 0 and 255")
         self._video_id = video_id
         self._manage_stream_switch = manage_stream_switch
+        self._keepalive = (
+            _keepalive_enabled_from_env() if keepalive is None else bool(keepalive)
+        )
 
         self._running = False
         self._video_count = 0
@@ -623,7 +888,7 @@ class P2PStreamer:
                     )
                 except Exception as exc:
                     _LOGGER.debug(
-                        "Could not enable device live-stream switch for %s: %s",
+                        "Could not switch front light (IoT 167) on for %s: %s",
                         self._sn_num,
                         exc,
                     )
@@ -685,7 +950,7 @@ class P2PStreamer:
                     )
                 except Exception as exc:
                     _LOGGER.debug(
-                        "Could not disable device live-stream switch for %s: %s",
+                        "Could not switch front light (IoT 167) off for %s: %s",
                         self._sn_num,
                         exc,
                     )
@@ -755,7 +1020,11 @@ class P2PStreamer:
         keepalive = status.get("contact", {}).get("keepalive", {})
         if keepalive:
             local_ips = _get_local_ips()
-            sig.send_wake_connect(device_uuid, keepalive, local_ips, 16685)
+            try:
+                sig.send_wake_connect(device_uuid, keepalive, local_ips, 16685)
+            except OSError as exc:
+                # Never let the signaling wake block the HTTP wake below.
+                _LOGGER.debug("Signaling wake failed for %s: %s", self._sn_num, exc)
 
         try:
             self._api.wake_device(self._sn_num, self._device.get("device_id", 0))
@@ -796,6 +1065,13 @@ class P2PStreamer:
             brand="77",
             country=api.country_code,
         )
+        keepalive = None
+        if self._keepalive:
+            keepalive = _SessionKeepalive(
+                sig,
+                registered_at=time.monotonic(),
+                heartbeat_interval=reg.get("hb") if isinstance(reg, dict) else None,
+            )
 
         # Hello webrtcsvr
         sig.webrtc_hello_full()
@@ -859,6 +1135,7 @@ class P2PStreamer:
                 dev_nat,
                 coturn_ip,
                 remote,
+                keepalive,
             )
         finally:
             self._send_active_vvp_command(VVP_CMD_STOP)
@@ -875,6 +1152,7 @@ class P2PStreamer:
         dev_nat,
         coturn_ip,
         remote,
+        keepalive: _SessionKeepalive | None = None,
     ) -> tuple[int, int]:
         """SDP exchange, ICE, KCP, VVP — the core streaming loop."""
         api = self._api
@@ -986,6 +1264,13 @@ class P2PStreamer:
         except Exception:
             pass
 
+        # A logout from the previous session can still put a battery camera
+        # to sleep after it answered this offer (app capture: dormancy push
+        # 235 ms after the answer).  Stop early so the caller re-wakes it.
+        if _dormancy_reported(sig, device_uuid):
+            _LOGGER.info("Camera reported dormancy during negotiation; ending attempt")
+            return (0, 0)
+
         # TURN permissions + channel binds
         camera_wan_ip = dev_nat.get("wan_ip", "")
         perm_ips = {c["ip"] for c in camera_candidates}
@@ -1041,6 +1326,9 @@ class P2PStreamer:
         camera_addrs = {(c["ip"], c["port"]) for c in camera_candidates}
         confirmed_peer: list = [None]
         direct_send_addrs: set[tuple[str, int]] = set()
+        source_filter = _MediaSourceFilter(
+            turn, camera_candidates, ice_pwd, camera_wan_ip
+        )
 
         def _udp_send(data):
             # Match the Android SDK bootstrap: send IVA/KCP through the single
@@ -1070,13 +1358,15 @@ class P2PStreamer:
                     pass
                 if not remote and c.get("type") != "relay":
                     try:
-                        _send_direct_ice_binding(
-                            turn.peer_sock,
-                            c["ip"],
-                            c["port"],
-                            ice_ufrag,
-                            camera_ufrag,
-                            camera_pwd,
+                        source_filter.remember_check(
+                            _send_direct_ice_binding(
+                                turn.peer_sock,
+                                c["ip"],
+                                c["port"],
+                                ice_ufrag,
+                                camera_ufrag,
+                                camera_pwd,
+                            )
                         )
                     except OSError:
                         pass
@@ -1106,13 +1396,13 @@ class P2PStreamer:
         }
 
         # State
-        ice_deadline = time.time() + 30
-        ice_resend_at = time.time() + 2
-        login_resend_at = time.time() + 2
-        heartbeat_at = time.time() + 3
-        iva_heartbeat_at = time.time() + 3
-        turn_renewal_at = time.time() + 60
-        stun_keepalive_at = time.time() + 5
+        ice_deadline = time.monotonic() + 30
+        ice_resend_at = time.monotonic() + 2
+        retransmit_at = time.monotonic() + _KCP_RETRANSMIT_INTERVAL
+        heartbeat_at = time.monotonic() + 3
+        iva_heartbeat_at = time.monotonic() + 3
+        turn_renewal_at = time.monotonic() + 60
+        stun_keepalive_at = time.monotonic() + 5
 
         ice_count = 0
         confirmed_addr = None
@@ -1123,10 +1413,9 @@ class P2PStreamer:
         stream_frame_count = 0
         stream_video_count = 0
         stream_total_bytes = 0
-        stream_start_time = time.time()
+        stream_start_time = time.monotonic()
         last_video_time = None
         last_kcp_data_time = None
-        last_nudge_time = 0.0
         last_skip_time = 0.0
         last_stream_restart_time = 0.0
         kcp_push_count = 0
@@ -1154,7 +1443,7 @@ class P2PStreamer:
                 if ftype in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME):
                     stream_video_count += 1
                     stream_total_bytes += len(media_data)
-                    last_video_time = time.time()
+                    last_video_time = time.monotonic()
                     if self.on_video:
                         self.on_video(media_data)
                     return True
@@ -1182,25 +1471,38 @@ class P2PStreamer:
 
         _packet_buf: deque = deque()
 
-        while self._running and time.time() < ice_deadline:
-            now = time.time()
+        while self._running and time.monotonic() < ice_deadline:
+            now = time.monotonic()
 
             if (
                 login_ok
-                and last_video_time
-                and now - last_video_time > _VIDEO_STALL_END_SESSION
+                and not stream_video_count
+                and now - stream_start_time >= _FIRST_VIDEO_TIMEOUT
             ):
+                _LOGGER.info(
+                    "No video after VVP login for %.0fs; ending session",
+                    now - stream_start_time,
+                )
+                return (stream_video_count, stream_total_bytes)
+
+            video_idle_since = (
+                last_video_time if last_video_time is not None else stream_start_time
+            )
+            if login_ok and now - video_idle_since > _VIDEO_STALL_END_SESSION:
                 _LOGGER.info(
                     "Video stalled for %.0fs (live window ended); ending session "
                     "for reconnect",
-                    now - last_video_time,
+                    now - video_idle_since,
                 )
                 break
 
+            # STOP/START only recovers a stream that was flowing (as in
+            # 0.1.11): before the first frame the camera may still be
+            # starting its encoder, and _FIRST_VIDEO_TIMEOUT ends the attempt.
             if (
                 login_ok
-                and last_video_time
-                and now - last_video_time > _VIDEO_STALL_RESTART_DELAY
+                and last_video_time is not None
+                and now - video_idle_since > _VIDEO_STALL_RESTART_DELAY
                 and now - last_stream_restart_time > _VIDEO_STALL_RESTART_INTERVAL
             ):
                 restarted = self._restart_active_vvp_stream()
@@ -1211,6 +1513,25 @@ class P2PStreamer:
                     _LOGGER.info(
                         "Restarted stalled live stream in the existing P2P session"
                     )
+
+            if now >= retransmit_at:
+                kcp.retransmit_unacked()
+                retransmit_at = now + _KCP_RETRANSMIT_INTERVAL
+            if not login_ok and now >= ice_resend_at:
+                _send_ice_checks()
+                ice_resend_at = now + 2
+            # No extra "gap nudge" ACKs: like the Android client, ACK each
+            # received PUSH once with its echoed ts.  Unsolicited ACKs feed the
+            # camera's ikcp a bogus RTT sample and inflate its RTO.
+            if (
+                login_ok
+                and now - video_idle_since > _KCP_GAP_SKIP_DELAY
+                and now - last_skip_time > _KCP_GAP_SKIP_DELAY
+                and kcp.skip_gap()
+            ):
+                last_skip_time = now
+                kcp.flush_acks()
+                _drain_kcp_queue()
 
             # Heartbeats
             if login_ok and now >= heartbeat_at:
@@ -1233,8 +1554,11 @@ class P2PStreamer:
             if login_ok and now >= turn_renewal_at:
                 try:
                     # Renews the allocation, permissions (300 s) and channel
-                    # bindings (600 s) that are due — RFC 8656 §9/§12.
-                    turn_renewal_at = now + turn.renew_due()
+                    # bindings (600 s) that are due — RFC 8656 §9/§12 — while
+                    # media is relayed.
+                    turn_renewal_at = _next_turn_renewal(
+                        turn, confirmed_peer[0], now
+                    )
                 except TurnRenewalRefusedError as exc:
                     _LOGGER.warning(
                         "TURN refused a session renewal (%s); ending P2P "
@@ -1242,8 +1566,6 @@ class P2PStreamer:
                         exc,
                     )
                     return (stream_video_count, stream_total_bytes)
-                except Exception:
-                    turn_renewal_at = now + 5
 
             if not login_ok and now >= stun_keepalive_at:
                 try:
@@ -1255,22 +1577,28 @@ class P2PStreamer:
                     pass
                 stun_keepalive_at = now + 10
 
+            if keepalive is not None:
+                keepalive.tick(now, turn, confirmed_peer[0])
+            # The same race after the trickle wait: the keepalives read msgsvr
+            # about once a second, so a dormancy push that lands while the
+            # camera stays silent ends the attempt instead of the ICE deadline.
+            if not login_ok and _dormancy_reported(sig, device_uuid):
+                _LOGGER.info(
+                    "Camera reported dormancy before the VVP login; ending attempt"
+                )
+                return (0, 0)
+
             # Batch drain
             if not _packet_buf:
                 kcp.flush_acks()
                 _packet_buf.extend(_recv_udp_batch(turn, 0.5))
                 if not _packet_buf:
-                    if now >= ice_resend_at:
-                        _send_ice_checks()
-                        kcp.retransmit_unacked()
-                        ice_resend_at = now + 2
-                    if now >= login_resend_at:
-                        kcp.retransmit_unacked()
-                        login_resend_at = now + 5
                     continue
 
             raw, addr, from_turn_socket = _packet_buf.popleft()
             if len(raw) < 4:
+                continue
+            if not source_filter.accept(raw, addr, from_turn_socket):
                 continue
 
             data = raw
@@ -1369,6 +1697,10 @@ class P2PStreamer:
                     elif msg["type"] == BINDING_RESPONSE:
                         if addr[0] == turn.server_ip:
                             continue
+                        if not source_filter.answers_our_check(msg):
+                            # Only an answer to one of our own checks may
+                            # nominate the direct path.
+                            continue
                         confirmed_addr = addr
                         if not remote and addr[0] != coturn_ip:
                             direct_send_addrs.add(addr)
@@ -1384,13 +1716,18 @@ class P2PStreamer:
                         continue
 
             # KCP processing
-            kcp_seg = parse_kcp_segment(data)
-            if kcp_seg:
+            if via_turn:
+                data = _strip_relay_kcp_trailer(data)
+            kcp_segments = parse_kcp_segments(data)
+            if kcp_segments:
                 result = kcp.process_input(data)
                 kcp.flush_acks()
-                if kcp_seg["cmd"] == 81:
-                    kcp_push_count += 1
-                    last_kcp_data_time = time.time()
+                push_count = sum(
+                    segment["cmd"] == 81 for segment in kcp_segments
+                )
+                if push_count:
+                    kcp_push_count += push_count
+                    last_kcp_data_time = time.monotonic()
                     if source_addr:
                         cp_ip, cp_port = source_addr
                         is_direct = _is_direct_peer_path(
@@ -1425,7 +1762,7 @@ class P2PStreamer:
                         if payload:
                             if not login_ok:
                                 login_ok = True
-                                stream_start_time = time.time()
+                                stream_start_time = time.monotonic()
                                 if self.on_login:
                                     self.on_login()
                                 hb = build_vvp_packet(
@@ -1438,37 +1775,21 @@ class P2PStreamer:
                                 kcp.send_iva_data(hb)
                                 vvp_seq += 1
                                 self._remember_vvp_sequence(vvp_seq)
-                            ice_deadline = max(ice_deadline, time.time() + 30)
+                            ice_deadline = max(ice_deadline, time.monotonic() + 30)
                             _handle_stream_payload(payload)
                         _drain_kcp_queue()
 
                 # Stall recovery + deadline management
                 if login_ok:
                     kcp_alive = (
-                        last_kcp_data_time and time.time() - last_kcp_data_time < 20
+                        last_kcp_data_time and time.monotonic() - last_kcp_data_time < 20
                     )
                     if not kcp_alive and last_kcp_data_time:
                         break
-                    if last_video_time and time.time() - last_video_time < 10:
-                        ice_deadline = max(ice_deadline, time.time() + 15)
+                    if last_video_time and time.monotonic() - last_video_time < 10:
+                        ice_deadline = max(ice_deadline, time.monotonic() + 15)
                     elif kcp_alive:
-                        ice_deadline = max(ice_deadline, time.time() + 10)
-                    if (
-                        last_video_time
-                        and time.time() - last_video_time > _KCP_GAP_NUDGE_DELAY
-                    ):
-                        if time.time() - last_nudge_time > _KCP_GAP_NUDGE_DELAY:
-                            kcp.send_gap_nudge()
-                            last_nudge_time = time.time()
-                        stall_time = time.time() - last_video_time
-                        if (
-                            stall_time > _KCP_GAP_SKIP_DELAY
-                            and time.time() - last_skip_time > _KCP_GAP_SKIP_DELAY
-                            and kcp.skip_gap()
-                        ):
-                            last_skip_time = time.time()
-                            kcp.flush_acks()
-                            _drain_kcp_queue()
+                        ice_deadline = max(ice_deadline, time.monotonic() + 10)
                 continue
 
             # Raw IVA frame
@@ -1481,7 +1802,7 @@ class P2PStreamer:
         # Connection loop done — enter continuation receiver if we got video
         if not login_ok:
             last_kcp_age = (
-                round(time.time() - last_kcp_data_time, 1)
+                round(time.monotonic() - last_kcp_data_time, 1)
                 if last_kcp_data_time
                 else None
             )
@@ -1516,7 +1837,7 @@ class P2PStreamer:
 
         if (
             last_video_time
-            and time.time() - last_video_time > _VIDEO_STALL_END_SESSION
+            and time.monotonic() - last_video_time > _VIDEO_STALL_END_SESSION
         ):
             return (stream_video_count, stream_total_bytes)
 
@@ -1532,6 +1853,13 @@ class P2PStreamer:
             stream_video_count,
             stream_total_bytes,
             stream_start_time,
+            last_video_time=last_video_time,
+            last_kcp_data_time=last_kcp_data_time,
+            last_stream_restart_time=last_stream_restart_time,
+            turn_renewal_at=turn_renewal_at,
+            confirmed_peer=confirmed_peer[0],
+            source_filter=source_filter,
+            keepalive=keepalive,
         )
         return (v2, b2)
 
@@ -1551,22 +1879,41 @@ class P2PStreamer:
         video_count_start,
         bytes_start,
         start_time,
+        *,
+        last_video_time: float | None = None,
+        last_kcp_data_time: float | None = None,
+        last_stream_restart_time: float | None = None,
+        turn_renewal_at: float | None = None,
+        confirmed_peer: tuple[str, int, bool] | None = None,
+        source_filter: _MediaSourceFilter | None = None,
+        keepalive: _SessionKeepalive | None = None,
     ) -> tuple[int, int]:
-        """Continue receiving video after the connection loop."""
+        """Continue receiving video after the connection loop.
+
+        The connection loop hands over its stall clocks (last video frame,
+        last KCP PUSH, last VVP restart) and TURN renewal deadline so the
+        hand-over does not restart them (C106, C75): a camera that went
+        silent ends the session about 30 s after its last frame, not 50 s.
+        It also hands over the media path it confirmed (``confirmed_peer``,
+        None when unknown), its source filter (None accepts every source)
+        and its session keepalives.  Clocks left as None start now.
+        """
         frame_count = frame_count_start
         video_frame_count = video_count_start
         total_bytes = bytes_start
-        last_video_time: float | None = None
-        if video_frame_count:
-            last_video_time = time.time()
-        last_kcp_data_time = time.time()
-        last_nudge_time = 0.0
+        if last_video_time is None and video_frame_count:
+            last_video_time = time.monotonic()
+        if last_kcp_data_time is None:
+            last_kcp_data_time = time.monotonic()
         last_skip_time = 0.0
-        last_stream_restart_time = 0.0
+        if last_stream_restart_time is None:
+            last_stream_restart_time = 0.0
         vvp_seq = vvp_seq_start
-        last_heartbeat = time.time()
-        last_iva_heartbeat = time.time()
-        turn_renewal_at = time.time() + 60
+        last_heartbeat = time.monotonic()
+        last_iva_heartbeat = time.monotonic()
+        if turn_renewal_at is None:
+            turn_renewal_at = time.monotonic() + 60
+        retransmit_at = time.monotonic() + _KCP_RETRANSMIT_INTERVAL
 
         def _process_kcp_message(msg_data):
             nonlocal frame_count, video_frame_count, total_bytes, last_video_time
@@ -1597,7 +1944,7 @@ class P2PStreamer:
                     if ftype in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME):
                         video_frame_count += 1
                         total_bytes += len(media_data)
-                        last_video_time = time.time()
+                        last_video_time = time.monotonic()
                         if self.on_video:
                             self.on_video(media_data)
                         return True
@@ -1635,10 +1982,45 @@ class P2PStreamer:
             # buffer happens to be empty: continuous packet flow used to
             # starve them until the allocation, permissions and channel
             # bindings expired (RFC 8656 §9/§12).
-            now = time.time()
+            now = time.monotonic()
+            if not video_frame_count and now - start_time >= _FIRST_VIDEO_TIMEOUT:
+                _LOGGER.info(
+                    "No video after VVP login for %.0fs; ending session",
+                    now - start_time,
+                )
+                break
+            video_idle_since = (
+                last_video_time if last_video_time is not None else start_time
+            )
+            if now - video_idle_since > _VIDEO_STALL_END_SESSION:
+                _LOGGER.info(
+                    "Video stalled for %.0fs; ending session for reconnect",
+                    now - video_idle_since,
+                )
+                break
+            if (
+                last_video_time is not None
+                and now - video_idle_since > _VIDEO_STALL_RESTART_DELAY
+                and now - last_stream_restart_time > _VIDEO_STALL_RESTART_INTERVAL
+            ):
+                if self._restart_active_vvp_stream():
+                    last_stream_restart_time = now
+                    vvp_seq = self._active_vvp_session["next_sequence"]
+            if now >= retransmit_at:
+                kcp.retransmit_unacked()
+                retransmit_at = now + _KCP_RETRANSMIT_INTERVAL
+            if (
+                now - video_idle_since > _KCP_GAP_SKIP_DELAY
+                and now - last_skip_time > _KCP_GAP_SKIP_DELAY
+                and kcp.skip_gap()
+            ):
+                last_skip_time = now
+                kcp.flush_acks()
+                while (message := kcp.poll_data()) is not None:
+                    _process_kcp_message(message)
             if now >= turn_renewal_at:
                 try:
-                    turn_renewal_at = now + turn.renew_due()
+                    turn_renewal_at = _next_turn_renewal(turn, confirmed_peer, now)
                 except TurnRenewalRefusedError as exc:
                     _LOGGER.warning(
                         "TURN refused a session renewal (%s); ending P2P "
@@ -1646,14 +2028,14 @@ class P2PStreamer:
                         exc,
                     )
                     return (video_frame_count, total_bytes)
-                except Exception:
-                    turn_renewal_at = now + 5
+            if keepalive is not None:
+                keepalive.tick(now, turn, confirmed_peer)
 
             if not _recv_buf:
                 kcp.flush_acks()
                 _recv_buf.extend(_recv_udp_batch(turn, 0.5))
                 if not _recv_buf:
-                    now = time.time()
+                    now = time.monotonic()
                     if host_key and now - last_heartbeat >= 10:
                         hb = build_vvp_packet(
                             cmd=VVP_CMD_HEARTBEAT,
@@ -1680,53 +2062,15 @@ class P2PStreamer:
                     if last_kcp_data_time and now - last_kcp_data_time > 20:
                         _LOGGER.debug("No KCP data for 20s, ending session")
                         break
-                    if (
-                        last_video_time
-                        and now - last_video_time > _VIDEO_STALL_END_SESSION
-                    ):
-                        _LOGGER.info(
-                            "Video stalled for %.0fs (live window ended); "
-                            "ending session for reconnect",
-                            now - last_video_time,
-                        )
-                        break
-                    if (
-                        last_video_time
-                        and now - last_video_time > _VIDEO_STALL_RESTART_DELAY
-                        and now - last_stream_restart_time
-                        > _VIDEO_STALL_RESTART_INTERVAL
-                    ):
-                        restarted = self._restart_active_vvp_stream()
-                        if self._active_vvp_session is not None:
-                            vvp_seq = self._active_vvp_session["next_sequence"]
-                        if restarted:
-                            last_stream_restart_time = now
-                            _LOGGER.info(
-                                "Restarted stalled live stream in the existing "
-                                "P2P session"
-                            )
-                    if last_video_time and now - last_video_time > _KCP_GAP_NUDGE_DELAY:
-                        if now - last_nudge_time > _KCP_GAP_NUDGE_DELAY:
-                            kcp.send_gap_nudge()
-                            last_nudge_time = now
-                        stall = now - last_video_time
-                        if (
-                            stall > _KCP_GAP_SKIP_DELAY
-                            and now - last_skip_time > _KCP_GAP_SKIP_DELAY
-                            and kcp.skip_gap()
-                        ):
-                            last_skip_time = now
-                            kcp.flush_acks()
-                            while True:
-                                q = kcp.poll_data()
-                                if not q:
-                                    break
-                                _process_kcp_message(q)
                     continue
 
             raw, addr, from_turn_socket = _recv_buf.popleft()
             timeout_count = 0
             if len(raw) < 4:
+                continue
+            if source_filter is not None and not source_filter.accept(
+                raw, addr, from_turn_socket
+            ):
                 continue
 
             # Unwrap TURN framing
@@ -1787,10 +2131,12 @@ class P2PStreamer:
                 continue
 
             # KCP processing
-            seg = parse_kcp_segment(data)
-            if seg:
-                if seg["cmd"] == 81:
-                    last_kcp_data_time = time.time()
+            if from_turn_socket:
+                data = _strip_relay_kcp_trailer(data)
+            segments = parse_kcp_segments(data)
+            if segments:
+                if any(segment["cmd"] == 81 for segment in segments):
+                    last_kcp_data_time = time.monotonic()
                 result = kcp.process_input(data)
                 kcp.flush_acks()
                 if result:
@@ -1802,24 +2148,14 @@ class P2PStreamer:
                             if not q:
                                 break
                             _process_kcp_message(q)
-                # Stall recovery
-                now = time.time()
-                if last_video_time and now - last_video_time > _KCP_GAP_SKIP_DELAY:
-                    if now - last_skip_time > _KCP_GAP_SKIP_DELAY and kcp.skip_gap():
-                        last_skip_time = now
-                        kcp.flush_acks()
-                        while True:
-                            q = kcp.poll_data()
-                            if not q:
-                                break
-                            _process_kcp_message(q)
+                now = time.monotonic()
                 if last_kcp_data_time and now - last_kcp_data_time > 20:
                     break
             elif data[0] == 0xFF and data[1] == 0x01:
                 kcp.process_input(data)
 
             # Heartbeats
-            now = time.time()
+            now = time.monotonic()
             if host_key and now - last_heartbeat >= 10:
                 hb = build_vvp_packet(
                     cmd=VVP_CMD_HEARTBEAT,

@@ -20,13 +20,18 @@ The Meari Coturn server uses:
 import binascii
 import hashlib
 import hmac
+import logging
 import os
 import socket
 import struct
 import time
+from collections import deque
+
+_LOGGER = logging.getLogger(__name__)
 
 # STUN message types
 BINDING_REQUEST = 0x0001
+BINDING_INDICATION = 0x0011
 BINDING_RESPONSE = 0x0101
 ALLOCATE_REQUEST = 0x0003
 ALLOCATE_RESPONSE = 0x0103
@@ -80,6 +85,10 @@ PERMISSION_LIFETIME = 300
 CHANNEL_BIND_LIFETIME = 600
 DEFAULT_ALLOCATION_LIFETIME = 600
 RENEWAL_MARGIN = 30.0
+_MAX_PENDING_RELAY_BYTES = 4 * 1024 * 1024
+# Bounds the preserved datagrams by count too: empty datagrams never reach
+# the byte cap.
+_MAX_PENDING_RELAY_DATAGRAMS = 4096
 
 
 class TurnError(RuntimeError):
@@ -87,7 +96,11 @@ class TurnError(RuntimeError):
 
 
 class TurnRenewalRefusedError(TurnError):
-    """The server refused to renew an allocation, permission or binding."""
+    """The server refused to renew an allocation, permission or binding.
+
+    The streaming loops end a relayed session on it.  Sessions whose media
+    is direct no longer renew TURN at all, so they never see this error.
+    """
 
 
 def _renewal_delay(lifetime):
@@ -150,6 +163,30 @@ def _add_integrity(msg_type, attrs_bytes, txn_id, key):
     hmac_val = hmac.new(key, header + attrs_bytes, hashlib.sha1).digest()
     attrs_bytes += _encode_attr(ATTR_MESSAGE_INTEGRITY, hmac_val)
     return attrs_bytes
+
+
+def _check_integrity(data, key):
+    """True when ``data`` carries a MESSAGE-INTEGRITY valid for ``key``.
+
+    The HMAC-SHA1 covers the message up to the attribute, with the header
+    length counting through it (RFC 8489 §14.5).  ICE checks use the
+    receiver's ice-pwd as key; every camera check in the app capture
+    verifies this way.
+    """
+    if len(data) < 20:
+        return False
+    length = struct.unpack_from(">H", data, 2)[0]
+    pos = 20
+    while pos + 4 <= min(len(data), 20 + length):
+        attr_type, attr_length = struct.unpack_from(">HH", data, pos)
+        if attr_type == ATTR_MESSAGE_INTEGRITY:
+            if attr_length != 20 or pos + 24 > len(data):
+                return False
+            header = data[:2] + struct.pack(">H", pos - 20 + 24) + data[4:20]
+            expected = hmac.new(key, header + data[20:pos], hashlib.sha1).digest()
+            return hmac.compare_digest(expected, data[pos + 4:pos + 24])
+        pos += 4 + ((attr_length + 3) & ~3)
+    return False
 
 
 def _build_xts_ice_binding_request(
@@ -232,6 +269,12 @@ class TurnClient:
         self.realm = realm
         self.sock = None
         self.peer_sock = None
+        # Control transactions share the relay socket with media and ICE.
+        # Preserve unrelated datagrams until the streaming owner reads them.
+        self._pending_datagrams = deque()
+        self._pending_datagram_bytes = 0
+        # Datagrams from anyone but the TURN server, dropped by transactions.
+        self.foreign_datagrams = 0
         self.nonce = None
         self.relay_ip = None
         self.relay_port = None
@@ -286,10 +329,31 @@ class TurnClient:
     def _send(self, data):
         self.sock.sendto(data, (self.server_ip, self.server_port))
 
-    def _recv(self, timeout=5.0):
+    def _recv_datagram(self, timeout=5.0):
         self.sock.settimeout(timeout)
-        data, addr = self.sock.recvfrom(65536)
-        return data
+        return self.sock.recvfrom(65536)
+
+    def drain_pending_datagrams(self, limit=2000):
+        """Return relay datagrams preserved during control I/O, in wire order."""
+        packets = []
+        while self._pending_datagrams and len(packets) < limit:
+            packet = self._pending_datagrams.popleft()
+            self._pending_datagram_bytes -= len(packet[0])
+            packets.append(packet)
+        return packets
+
+    def _preserve_datagram(self, data, addr):
+        self._pending_datagrams.append((data, addr))
+        self._pending_datagram_bytes += len(data)
+
+    def _drop_foreign_datagram(self, addr):
+        self.foreign_datagrams += 1
+        if self.foreign_datagrams <= 32:
+            _LOGGER.debug(
+                "Dropped TURN-socket datagram from unexpected source %s:%s",
+                addr[0],
+                addr[1],
+            )
 
     def drain_socket(self):
         """Drain any buffered packets from the socket (non-blocking)."""
@@ -309,11 +373,39 @@ class TurnClient:
             print(f"[TURN] Drained {drained} buffered packets")
 
     def _stun_request(self, msg_type, extra_attrs=b"", auth=True):
+        """Run a STUN/TURN request, renewing a nonce the server rotated.
+
+        RFC 8489 §9.2: a 438 (Stale Nonce) error, or a 401 that carries a
+        NONCE, means the server no longer accepts our nonce (coturn rotates
+        it every 600 s by default).  Adopt the new NONCE and REALM and repeat
+        the request once, with a new transaction ID and MESSAGE-INTEGRITY.
+        The caller sees the error only if the repeated request fails too.
+        """
+        resp = self._stun_transaction(msg_type, extra_attrs, auth)
+        if auth and self.nonce and self._adopt_renewed_nonce(msg_type, resp):
+            resp = self._stun_transaction(msg_type, extra_attrs, auth)
+        return resp
+
+    def _adopt_renewed_nonce(self, msg_type, resp):
+        """Take the NONCE/REALM of a 438 or 401 error; True if renewed."""
+        if not resp or resp["type"] != msg_type | 0x0110:
+            return False
+        code, _ = _error_code(resp)
+        nonce = resp["attrs"].get(ATTR_NONCE)
+        if code not in (401, 438) or not nonce:
+            return False
+        self.nonce = nonce
+        realm = resp["attrs"].get(ATTR_REALM)
+        if realm:
+            self.realm = realm.rstrip(b"\x00").decode("utf-8", errors="replace")
+        return True
+
+    def _stun_transaction(self, msg_type, extra_attrs=b"", auth=True):
         """Build, send, and receive a STUN request with optional auth.
 
-        Filters out unrelated packets (ICE binding checks, Data Indications)
-        that may arrive on the same socket while waiting for the TURN response.
-        Matches responses by transaction ID to prevent consuming wrong responses.
+        Preserves unrelated media and ICE datagrams for the streaming owner.
+        Matches responses by transaction ID and bounds the complete wait,
+        including time spent receiving unrelated traffic.
         """
         attrs = extra_attrs
         if auth and self.nonce:
@@ -332,15 +424,33 @@ class TurnClient:
         expected_success = msg_type | 0x0100
         expected_error = msg_type | 0x0110
 
-        # Try to receive matching response, skip unrelated packets
-        for _attempt in range(50):  # Max 50 packets before giving up
+        # Bound the entire transaction, including continuous media traffic.
+        deadline = self._clock() + 3.0
+        while self._clock() < deadline:
+            # Back off control I/O before it monopolizes the relay receive
+            # buffer. Every datagram already consumed remains deliverable;
+            # unread packets stay on the socket for the media owner.
+            if (
+                self._pending_datagram_bytes >= _MAX_PENDING_RELAY_BYTES
+                or len(self._pending_datagrams) >= _MAX_PENDING_RELAY_DATAGRAMS
+            ):
+                return None
             try:
-                resp_data = self._recv(timeout=3.0)
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    return None
+                resp_data, addr = self._recv_datagram(timeout=remaining)
             except socket.timeout:
                 return None
+            if (addr[0], addr[1]) != (self.server_ip, self.server_port):
+                # Only the TURN server talks on this socket: neither a
+                # response nor relayed media can come from anywhere else.
+                self._drop_foreign_datagram(addr)
+                continue
             parsed = _parse_stun(resp_data)
             if parsed is None:
-                continue  # Not a valid STUN packet (e.g., ChannelData)
+                self._preserve_datagram(resp_data, addr)
+                continue  # ChannelData belongs to the media receiver
             if parsed["type"] in (expected_success, expected_error):
                 # Match by transaction ID to avoid consuming wrong responses
                 if parsed["txn_id"] == txn_id:
@@ -353,8 +463,8 @@ class TurnClient:
                 if parsed["txn_id"] == txn_id:
                     return parsed
                 continue
-            # Skip unrelated packets (ICE checks, Data Indications, etc.)
-            continue
+            # ICE checks and Data Indications belong to the media receiver.
+            self._preserve_datagram(resp_data, addr)
         return None
 
     def stun_binding(self):
@@ -581,6 +691,12 @@ class TurnClient:
         called again (short when a request timed out and must be retried).
         Raises TurnRenewalRefusedError when the server refuses a renewal, so
         the caller can rebuild the session instead of ignoring it forever.
+
+        The P2P streaming loops call this only while media is relayed: once
+        the confirmed media path is direct they stop renewing (like the
+        vendor app, which releases TURN then) and let the allocation expire,
+        so a refusal ends relay sessions only.  Requests can block for up to
+        3 s each; callers count the returned delay from when this returns.
         """
         now = self._clock()
         retry_soon = False
@@ -664,11 +780,14 @@ class TurnClient:
 
         Returns (data_bytes, peer_ip, peer_port) or (None, None, None) on timeout.
         """
-        self.sock.settimeout(timeout)
-        try:
-            raw, addr = self.sock.recvfrom(65536)
-        except socket.timeout:
-            return None, None, None
+        if self._pending_datagrams:
+            raw, addr = self._pending_datagrams.popleft()
+            self._pending_datagram_bytes -= len(raw)
+        else:
+            try:
+                raw, addr = self._recv_datagram(timeout)
+            except socket.timeout:
+                return None, None, None
 
         if len(raw) < 4:
             return raw, None, None
@@ -712,6 +831,8 @@ class TurnClient:
         self.send_to_peer(peer_ip, peer_port, msg)
 
     def close(self):
+        self._pending_datagrams.clear()
+        self._pending_datagram_bytes = 0
         if self.sock:
             try:
                 self.sock.close()

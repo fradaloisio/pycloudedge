@@ -22,6 +22,8 @@ import hashlib
 import logging
 from typing import Optional
 
+from .utils import _safe_exception_text
+
 _LOGGER = logging.getLogger(__name__)
 
 _XOR_LIMIT = 1024
@@ -87,7 +89,9 @@ def decrypt_jpgx3_from_url(
             _LOGGER.debug("Alarm image too small (%d bytes)", len(r.content))
             return None
     except Exception as exc:
-        _LOGGER.debug("Failed to download alarm image: %s", exc)
+        # requests puts the full URL in its messages; the query is a bearer
+        # credential for the snapshot.
+        _LOGGER.debug("Failed to download alarm image: %s", _safe_exception_text(exc))
         return None
 
     if ".jpgx3" in url or ".jpgx2" in url:

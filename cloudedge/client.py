@@ -49,7 +49,14 @@ from .constants import (
 from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
 from .stream_profiles import extract_stream_capabilities
-from .utils import parse_retry_after, retry_on_failure
+from .utils import (
+    _payload_shape,
+    _safe_exception_text,
+    _sanitize_request_exception,
+    _url_without_query,
+    parse_retry_after,
+    retry_on_failure,
+)
 
 # Device online status values returned by get_device_online_status()
 DEVICE_STATUS_ONLINE = "online"
@@ -86,39 +93,6 @@ def _serialized(method):
     return guarded
 
 
-def _url_without_query(url: Any) -> str:
-    """Return the scheme/host/path of a URL, dropping the query string.
-
-    CloudEdge query strings carry signatures and tokens: they must never
-    reach exception messages or logs.
-    """
-    text = str(url or "")
-    return text.split("?", 1)[0]
-
-
-def _sanitize_request_exception(exc: Exception) -> str:
-    """Request failure text that is safe to expose.
-
-    Uses method-free facts only: HTTP status plus URL without query, or the
-    exception class for transport failures. The response body is never
-    included.
-    """
-    response = getattr(exc, "response", None)
-    if response is not None:
-        status = getattr(response, "status_code", None)
-        return f"HTTP {status} for {_url_without_query(getattr(response, 'url', ''))}"
-    request = getattr(exc, "request", None)
-    if request is not None:
-        return f"{type(exc).__name__} for {_url_without_query(getattr(request, 'url', ''))}"
-    return type(exc).__name__
-
-
-def _safe_exception_text(exc: Exception) -> str:
-    """Exception text safe for messages/logs: sanitized for HTTP requests."""
-    if isinstance(exc, requests.exceptions.RequestException):
-        return _sanitize_request_exception(exc)
-    return str(exc)
-
 # API list keys → readable product type when deviceTypeName is a CDN image URL
 _DEVICE_LIST_CATEGORY_LABELS = {
     "snap": "Camera",
@@ -139,6 +113,16 @@ _APP_STREAMING_METADATA_FIELDS = {
     "as_friend": "asFriend",
     "device_region": "region",
 }
+
+
+def _read_device_list(payload: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
+    """Read an optional list without treating malformed inventory as empty."""
+    devices = payload.get(key, [])
+    if not isinstance(devices, list) or any(
+        not isinstance(device, dict) for device in devices
+    ):
+        raise CloudEdgeError(f"Invalid device list response format ({key})")
+    return devices
 
 
 def _extract_app_streaming_metadata(device: Dict[str, Any]) -> Dict[str, Any]:
@@ -318,9 +302,19 @@ class CloudEdgeClient:
         on_disconnect=None,
         remote: bool = False,
         video_id: Optional[int] = None,
-        manage_stream_switch: bool = True,
+        manage_stream_switch: bool = False,
+        keepalive: Optional[bool] = None,
     ):
-        """Create a native P2P streamer for a CloudEdge camera device."""
+        """Create a native P2P streamer for a CloudEdge camera device.
+
+        ``manage_stream_switch`` is a legacy opt-in that toggles IoT 167
+        (FRONT_LIGHT_SWITCH) around each session; leave it ``False``.
+
+        ``keepalive`` switches the session keepalives of the vendor app
+        (see :class:`~cloudedge.p2p.p2p_streamer.P2PStreamer`). ``None``
+        leaves them on unless the ``CLOUDEDGE_P2P_KEEPALIVE`` environment
+        variable is ``0``/``false``/``no``/``off``.
+        """
         from .p2p.p2p_streamer import P2PStreamer
 
         return P2PStreamer(
@@ -333,6 +327,7 @@ class CloudEdgeClient:
             remote=remote,
             video_id=video_id,
             manage_stream_switch=manage_stream_switch,
+            keepalive=keepalive,
         )
 
     def refresh_streaming_metadata(self, device: Dict[str, Any]) -> Dict[str, Any]:
@@ -341,28 +336,74 @@ class CloudEdgeClient:
         The same physical camera can have different device IDs and host keys
         when it is accessed through accounts in different regions. Always use
         the values returned by the currently authenticated account.
+
+        Runs before every stream attempt, so it reads plain device listings
+        only (no OpenAPI config reads, no ping) and stops at the first one
+        that lists the camera; the client lock is taken per request, never
+        across the lookup. ``online`` is left untouched: a plain listing
+        only carries the raw cloud flag, not the caller's status.
         """
         serial_number = device.get("serial_number")
         if not serial_number:
             return device
 
         try:
-            current_devices = self.get_all_devices()
+            current_device = self._find_listed_device(
+                serial_number, device.get("home_id")
+            )
         except Exception as exc:
             self._log(
-                f"Could not refresh streaming metadata for {serial_number}: {exc}"
+                f"Could not refresh streaming metadata for {serial_number}: "
+                f"{_safe_exception_text(exc)}"
             )
             return device
 
-        for current_device in current_devices:
-            if current_device.get("serial_number") == serial_number:
-                device.update(current_device)
-                self._log(
-                    f"Refreshed account-specific streaming metadata for {serial_number}"
-                )
-                break
+        if current_device is not None:
+            device.update(
+                (key, value) for key, value in current_device.items() if key != "online"
+            )
+            self._log(
+                f"Refreshed account-specific streaming metadata for {serial_number}"
+            )
 
         return device
+
+    def _find_listed_device(self, serial_number: str, home_id: Any = None) -> Optional[Dict]:
+        """First plain listing entry for ``serial_number``, or ``None``.
+
+        Asks the listing the caller's dict came from first (its home, or the
+        owned devices: owned entries carry no ``home_id``), then the others
+        in :meth:`_collect_all_devices` order. Each listing is one locked
+        request without enhancement, so concurrent callers wait for one
+        request at most. A source failing for a non-transient reason (a
+        home of another account, the legacy endpoint gone) is skipped.
+        """
+        def search(fetch, *args) -> Optional[Dict]:
+            try:
+                listing = fetch(*args, enhance=False)
+            except (AuthenticationError, NetworkError, RateLimitError):
+                raise
+            except CloudEdgeError as exc:
+                self._log(f"Skipping a device listing: {exc}")
+                return None
+            for item in listing:
+                if item.get("serial_number") == serial_number:
+                    return item
+            return None
+
+        found = (
+            search(self.get_devices_by_home, home_id) if home_id
+            else search(self._get_owned_devices)
+        )
+        if found is not None:
+            return found
+        # Moved, or a dict from another account: walk the remaining listings.
+        for home in self.get_homes():
+            if not home_id or home.get("home_id") != home_id:
+                found = search(self.get_devices_by_home, home["home_id"])
+                if found is not None:
+                    return found
+        return search(self._get_owned_devices) if home_id else None
 
     def _detect_local_network(self) -> Optional[str]:
         """Detect the local network subnet."""
@@ -450,10 +491,15 @@ class CloudEdgeClient:
         try:
             # Use platform-appropriate ping command
             import platform
-            if platform.system().lower() == "windows":
+            system = platform.system().lower()
+            if system == "windows":
                 cmd = ["ping", "-n", "1", "-w", str(int(self.ping_timeout * 1000)), ip_address]
+            elif system in ("darwin", "freebsd"):
+                # BSD ping: -W is in milliseconds and only starts after the
+                # 1 s send interval; -t bounds the whole run in seconds.
+                cmd = ["ping", "-c", "1", "-t", str(max(1, math.ceil(self.ping_timeout))), ip_address]
             else:
-                cmd = ["ping", "-c", "1", "-W", str(int(self.ping_timeout)), ip_address]
+                cmd = ["ping", "-c", "1", "-W", str(max(1, math.ceil(self.ping_timeout))), ip_address]
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.ping_timeout + 1)
             is_online = result.returncode == 0
@@ -509,10 +555,18 @@ class CloudEdgeClient:
                 if self.debug:
                     self._log(f"Device {device.get('name', 'Unknown')} ({device_ip}): Ping unavailable, using API status={api_status}")
                 return api_status
-            elif ping_result is not None:
+            elif ping_result:
+                # A LAN reply can only add evidence that the device is up.
                 if self.debug:
-                    self._log(f"Device {device.get('name', 'Unknown')} ({device_ip}): API={api_status}, Ping={ping_result}, Using=Ping")
-                return ping_result
+                    self._log(f"Device {device.get('name', 'Unknown')} ({device_ip}): API={api_status}, Ping=True, Using=Ping")
+                return True
+            else:
+                # No reply proves nothing: battery cameras in power save
+                # answer late or never, and the IP may belong to another
+                # site that reuses the same private /24. Keep the API state.
+                if self.debug:
+                    self._log(f"Device {device.get('name', 'Unknown')} ({device_ip}): API={api_status}, Ping=False, Using=API")
+                return api_status
         elif device_ip:
             if self.debug:
                 self._log(f"Device {device.get('name', 'Unknown')} ({device_ip}): Not on local network, using API status={api_status}")
@@ -1532,7 +1586,7 @@ class CloudEdgeClient:
                     
                     homes.append({
                         'home_id': home.get('homeID'),
-                        'name': home.get('homeName', 'Unnamed'),
+                        'name': home.get('homeName') or 'Unnamed',
                         'owner': home.get('owner'),
                         'rooms': len(rooms),
                         'device_count': device_count
@@ -1627,8 +1681,8 @@ class CloudEdgeClient:
                 
                 for device_type in device_types:
                     if device_type in response_data:
-                        device_list = response_data[device_type]
-                        if isinstance(device_list, list):
+                        device_list = _read_device_list(response_data, device_type)
+                        if device_list:
                             for device in device_list:
                                 type_str, icon_url = _human_type_and_icon_url(
                                     device, list_category=device_type
@@ -1662,7 +1716,7 @@ class CloudEdgeClient:
                         f"Session rejected by API (Code: {error_code}): {error_msg}"
                     )
                 raise CloudEdgeError(
-                    f"Failed to retrieve home devices: {error_msg}",
+                    f"Failed to retrieve home devices: {error_msg} (Code: {error_code})",
                     details={"error_code": error_code, "message": error_msg, "home_id": home_id}
                 )
                 
@@ -1696,12 +1750,12 @@ class CloudEdgeClient:
         Without ``home_id`` this returns the **union** of both inventories the
         cloud exposes, because neither one is complete on its own:
 
-        * ``/v1/app/home/join/device/list`` per home — the only source for
+        * ``/v1/app/home/join/device/list`` per joined home — the only source for
           homes the account was invited to (``owner`` is False). This is what
           the CloudEdge app itself calls.
         * ``/ppstrongs/getDevice.action`` — the only source for devices the
-          account owns directly; the per-home endpoint returns an empty list
-          for the owner's own home even when it reports a device count.
+          account owns directly. The join endpoint is not valid for an
+          owner's home and can reject it with result code 1106 or 1107.
 
         Args:
             home_id (Optional[str]): Specific home ID to get devices from.
@@ -1730,13 +1784,15 @@ class CloudEdgeClient:
 
         Never returns a partial inventory: a caller that drops devices it
         cannot see (Home Assistant removes their entities and stops their
-        streams) must not act on a transient API failure. Transient
-        transport failures (:class:`NetworkError`) therefore propagate even
-        when one inventory already answered. The owned-device endpoint is
-        the one exception: once the homes answered, a *permanent-looking*
-        failure there (endpoint removed, unparseable response) is logged
-        instead of raised, so a legacy endpoint going away cannot take the
-        whole inventory down with it.
+        streams) must not act on an API failure. Failures of either
+        inventory therefore propagate even when the other one already
+        answered: transport errors, rate limiting, rejected sessions,
+        unknown result codes and malformed replies alike. The only
+        exception is an explicit sign that the legacy owned-device endpoint
+        no longer exists (HTTP 404/410, raised as :class:`CloudEdgeError`
+        with ``details["endpoint_unavailable"]``): once the homes listed at
+        least one device it is logged instead of raised, so the endpoint
+        going away cannot take the whole inventory down with it.
         """
         devices: List[Dict] = []
         seen = set()
@@ -1752,6 +1808,12 @@ class CloudEdgeClient:
         homes = self.get_homes()
         self._log(f"Collecting devices from {len(homes)} home(s)")
         for home in homes:
+            # Like the app, query the join endpoint only for homes we joined.
+            # Owned devices are collected below via getDevice.action. An
+            # owner's empty default home can reject the join request (1106),
+            # which must not prevent discovery of the account's shared cameras.
+            if home.get('owner') is True:
+                continue
             try:
                 _add(self.get_devices_by_home(home['home_id'], enhance=enhance))
             except AuthenticationError:
@@ -1766,17 +1828,14 @@ class CloudEdgeClient:
 
         try:
             _add(self._get_owned_devices(enhance=enhance))
-        except AuthenticationError:
-            raise
-        except (NetworkError, RateLimitError):
-            # A transient failure must not present a partial inventory as
-            # complete: consumers would drop the devices they cannot see.
-            # Fail the refresh so callers keep their previous data.
-            raise
-        except Exception as e:
-            if not devices:
+        except CloudEdgeError as e:
+            # Anything but the explicit endpoint-gone signal (an unknown
+            # resultCode included) must not present a partial inventory as
+            # complete: consumers would drop the owned cameras they cannot
+            # see. Fail the refresh so callers keep their previous data.
+            if not (devices and e.details.get("endpoint_unavailable")):
                 raise
-            self._log(f"Owned-device list failed, using home inventory only: {e}")
+            self._log(f"Owned-device endpoint unavailable, using home inventory only: {e}")
 
         self._log(f"Collected {len(devices)} device(s) in total")
         return devices
@@ -1812,21 +1871,25 @@ class CloudEdgeClient:
                 timeout=DEFAULT_TIMEOUT
             )
             response_data = response.json()
+            if not isinstance(response_data, dict):
+                raise CloudEdgeError("Invalid device list response format")
             
             if response_data.get("resultCode") == "1001":
                 self._log("Devices retrieved successfully!")
                 
-                # Debug: Log the actual response structure
+                # Debug: log the response shape only. Every device entry
+                # carries hostKey, device signatures, p2pInit and
+                # shareAccessSign.
                 if self.debug:
-                    self._log(f"API Response structure: {json.dumps(response_data, indent=2)}")
+                    self._log(f"API Response structure: {_payload_shape(response_data)}")
                 
                 device_types = ['nvr', 'ipc', 'chime', 'doorbell', 'snap']
                 standardized_devices = []
 
                 # Modern API: devices grouped by category key
                 for device_type in device_types:
-                    device_list = response_data.get(device_type)
-                    if not isinstance(device_list, list) or not device_list:
+                    device_list = _read_device_list(response_data, device_type)
+                    if not device_list:
                         continue
                     self._log(f"Found {len(device_list)} devices under '{device_type}' key")
                     for device in device_list:
@@ -1851,8 +1914,11 @@ class CloudEdgeClient:
 
                 # Older API fallback: devices under result.deviceList
                 if not standardized_devices:
-                    fallback_list = response_data.get("result", {}).get("deviceList", [])
-                    if isinstance(fallback_list, list) and fallback_list:
+                    result = response_data.get("result") or {}
+                    if not isinstance(result, dict):
+                        raise CloudEdgeError("Invalid device list response format")
+                    fallback_list = _read_device_list(result, "deviceList")
+                    if fallback_list:
                         self._log(f"Found {len(fallback_list)} devices under 'result.deviceList' key")
                         for device in fallback_list:
                             type_str, icon_url = _human_type_and_icon_url(
@@ -1887,6 +1953,18 @@ class CloudEdgeClient:
                     details={"error_code": error_code, "message": error_msg}
                 )
                 
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (404, 410):
+                # The legacy endpoint itself is gone: the one failure the
+                # merged inventory may tolerate (see _collect_all_devices).
+                raise CloudEdgeError(
+                    f"Owned-device endpoint unavailable: {_sanitize_request_exception(e)}",
+                    details={"endpoint_unavailable": True, "status_code": status},
+                ) from None
+            raise NetworkError(
+                f"Device list request failed: {_sanitize_request_exception(e)}"
+            ) from None
         except requests.exceptions.RequestException as e:
             raise NetworkError(
                 f"Device list request failed: {_sanitize_request_exception(e)}"
@@ -2512,6 +2590,9 @@ class CloudEdgeClient:
             
         Returns:
             Dict: Device information; optional configuration may be unavailable.
+                ``online`` is the inventory status (as in :meth:`get_devices`);
+                the ``getDeviceOnLine.action`` flag, ``False`` for every
+                sleeping battery camera, is under ``legacy_online``.
             
         Raises:
             DeviceNotFoundError: If device not found
@@ -2522,18 +2603,29 @@ class CloudEdgeClient:
         if not device:
             raise DeviceNotFoundError(f"Device '{device_name}' not found")
             
-        # Get device status
+        # Get device status: keep the legacy flag on its own key, it must
+        # not turn a dormant camera the inventory lists as online offline.
         status = self.get_device_status(device['device_id'])
         if status:
+            status = dict(status)
+            device['legacy_online'] = status.pop('online', None)
             device.update(status)
             
         # Get device configuration if requested
         if include_config:
             try:
                 config = self.get_device_config(device['serial_number'])
-                if config and 'result' in config and 'iot' in config['result']:
+                iot_data = None
+                if isinstance(config, dict):
+                    result = config.get('result')
+                    if isinstance(result, dict) and isinstance(result.get('iot'), dict):
+                        iot_data = result['iot']
+                    elif isinstance(config.get('iot'), dict):
+                        # Live /openapi/device/config responses carry
+                        # top-level action/code/iot/name (no 'result').
+                        iot_data = config['iot']
+                if iot_data is not None:
                     # Process IoT parameters for display
-                    iot_data = config['result']['iot']
                     processed_config = {}
                     
                     for param_code, value in iot_data.items():
@@ -2549,7 +2641,7 @@ class CloudEdgeClient:
                         
                     device['configuration'] = processed_config
             except Exception as e:
-                self._log(f"Failed to get device configuration: {e}")
+                self._log(f"Failed to get device configuration: {_safe_exception_text(e)}")
                 device['configuration'] = None
                 
         return device

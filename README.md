@@ -66,6 +66,10 @@ Optional dependencies:
   Home Assistant integration calls it from multiple executor threads);
   authentication, inventory and OpenAPI operations are serialized internally. The
   internal lock is never held while sleeping in wake-polling loops.
+  `refresh_streaming_metadata()` (run before every P2P stream attempt) reads
+  plain device listings only, one locked request at a time, starting with the
+  listing the device came from; it never pings, reads configuration or
+  changes the caller's `online`.
   Callers must not mutate `session_data` or the internal HTTP session.
 - **Session cache**: the cache file is bound to the account (username +
   region) that wrote it; another account on the same path cannot adopt the
@@ -79,14 +83,38 @@ Optional dependencies:
 - **MQTT recovery**: `get_mqtt_config()` is a read-only snapshot;
   `refresh_mqtt_config()` may fetch missing/expired platform credentials,
   at most once per minute. Run it in a worker and retry on later refreshes
-  if it returns `None`; no new account login is needed.
+  if it returns `None`; no new account login is needed. A running
+  `CloudEdgeMqttListener` calls it whenever the broker connection drops, so
+  its reconnects use renewed credentials.
 - **Wake deadlines**: `wait_for_online()` shares its remaining monotonic
   budget across HTTP timeouts, retries, token discovery and lock waits.
   Requests cannot strictly bound DNS resolution or trickling response bodies.
   Authentication failures propagate immediately.
-- **Transient inventory failures fail the refresh**: `get_devices()` raises
-  rather than returning a partial inventory, so callers never mistake a
-  network blip for removed devices.
+- **Inventory failures fail the refresh**: `get_devices()` raises rather than
+  returning a partial inventory, so callers never mistake a network blip, an
+  unknown result code or a malformed reply for removed devices. This holds
+  for the owned-device listing (`getDevice.action`) too, even after the homes
+  answered. The only exception: when that legacy endpoint answers HTTP
+  404/410 (`CloudEdgeError.details["endpoint_unavailable"]`) and the homes
+  listed at least one device, those devices are returned on their own.
+- **Online state**: `online` is the cloud's flag. With `enable_network_ping`
+  (the default) a camera on the host's /24 that answers a ping is reported
+  online; a missing reply never turns a cloud-online camera offline, since
+  sleeping battery cameras do not answer.
+- **P2P session keepalives**: while a stream runs, the streamer sends the
+  keepalives of the official app (a msgsvr heartbeat every register-reply
+  `hb` seconds, 30 so far, a webrtcsvr hello about every 21 s and, on a
+  direct path, a STUN indication to the camera every 30 s). They are on by default and keep a battery camera
+  streaming while a viewer is attached; switched off, the camera ends its
+  live window after about 2 minutes. Pass `keepalive=False` to
+  `create_streamer()` or `P2PStreamer`, or, when the argument is left out,
+  set `CLOUDEDGE_P2P_KEEPALIVE=0` (or `false`, `no`, `off`).
+- **TURN renewals**: the TURN allocation, permissions and channel bindings
+  are renewed only while media is relayed. Once ICE confirms a direct path,
+  renewals stop (the official app releases TURN at that point) and the
+  allocation expires on the server. A refused renewal
+  (`TurnRenewalRefusedError`) therefore ends relay sessions only; a TURN
+  refusal or outage does not end a session whose media is direct.
 
 ## Quick Start
 
@@ -304,7 +332,9 @@ CloudEdgeClient(
     country_code: str,
     phone_code: str,
     debug: bool = False,
-    session_cache_file: str = ".cloudedge_session_cache"
+    session_cache_file: str = ".cloudedge_session_cache",
+    enable_network_ping: bool = True,
+    ping_timeout: float = 2.0
 )
 ```
 
@@ -315,6 +345,10 @@ CloudEdgeClient(
 - `phone_code`: International phone code (e.g., "+1", "+39", "+49")
 - `debug`: Enable debug logging (default: False)
 - `session_cache_file`: Path to session cache file (default: ".cloudedge_session_cache")
+- `enable_network_ping`: Ping cameras on the host's /24 during `get_devices()`
+  to report a camera that answers as online (default: True). Each check reads
+  the camera's configuration and runs one ping; pass `False` to skip them.
+- `ping_timeout`: Seconds to wait for a ping reply (default: 2.0)
 
 #### Methods
 
@@ -420,6 +454,10 @@ if info:
         for param, details in info['configuration'].items():
             print(f"{param}: {details['formatted']}")
 ```
+
+`online` is the same status `get_devices()` reports. The legacy
+`get_device_status()` flag, `False` for every sleeping battery camera, is
+returned as `legacy_online`, next to `last_seen`.
 
 ##### `get_homes() -> List[Dict]`
 
@@ -576,17 +614,24 @@ twine upload dist/*
 
 ### Debug Mode
 
-Enable debug mode to see detailed API requests and responses:
+Enable debug mode to log the client's progress at DEBUG level (logger
+`pycloudedge.client`; the MQTT listener logs under `cloudedge.mqtt`):
 
 ```python
 client = CloudEdgeClient(..., debug=True)
 ```
 
 This will show:
-- Authentication process details
-- API request URLs and parameters
-- Response data
-- Error details
+- Authentication, endpoint discovery and request progress
+- The shape of the device-list response (keys, value types, list lengths)
+- MQTT events: type, device id and whether a snapshot URL is present
+- Error details (URLs without their query strings)
+
+The client and the MQTT listener log shapes, not values: no session token,
+host keys, device signatures, P2P init strings, share signatures or signed
+snapshot URLs. The alarm snapshot URL handed to MQTT callbacks
+(`extra["url"]`) is a bearer link: anyone holding it can download the image
+until it expires, so do not log or publish it.
 
 ## Contributing
 

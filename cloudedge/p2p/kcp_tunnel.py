@@ -214,8 +214,9 @@ class KcpTunnel:
         # Receive buffer for out-of-order segments: sn -> (frg, data)
         self.recv_buf = {}
         # Next expected receive sequence number for ordered delivery
-        # Initialized to -1 (sentinel); set to peer's first sn on first PUSH
-        self.next_recv_sn = -1
+        # A fresh KCP conversation starts at zero. The first UDP packet
+        # received may contain the tail of a reordered fragmented message.
+        self.next_recv_sn = 0
 
         # Queue of fully reassembled messages ready for delivery
         self.recv_queue = []
@@ -317,7 +318,8 @@ class KcpTunnel:
         # segments we're still missing and retransmits them (fast retransmit
         # triggers after fastack >= 2).  The camera's 128-segment send window
         # fills in ~1.2s; fast retransmit recovers gaps in ~200ms.
-        # Gap skip at 2s is the safety net for persistent losses.
+        # The 5 s gap skip (_KCP_GAP_SKIP_DELAY in p2p_streamer) is the safety
+        # net for persistent losses.
         una = max(self.next_recv_sn, 0)
 
         # Build compound ACK packet(s), splitting at ~1200 bytes to stay
@@ -338,32 +340,15 @@ class KcpTunnel:
             self.send_func(bytes(buf))
 
     def send_gap_nudge(self):
-        """Send ACKs for segments above current gap to trigger fast retransmit.
+        """Deprecated no-op, kept for API compatibility.
 
-        When next_recv_sn is missing from recv_buf but higher segments exist,
-        the camera's KCP should retransmit the missing segment upon receiving
-        these "skip" ACKs.  Call periodically when video stalls.
+        Re-ACKing buffered segments while a hole persists does not help: the
+        camera's ikcp computes an RTT sample (current - ts) from every ACK
+        segment, so extra ACKs - with our clock or with the stale echoed ts -
+        inflate its RTO and delay the retransmission of the missing segment.
+        Each received PUSH is ACKed exactly once by flush_acks().
         """
-        if self.next_recv_sn < 0 or not self.recv_buf:
-            return False
-        # Check if there's actually a gap at next_recv_sn
-        if self.next_recv_sn in self.recv_buf:
-            return False  # No gap — will be assembled on next process_input
-        above_gap = sorted(sn for sn in self.recv_buf if sn > self.next_recv_sn)[:20]
-        if not above_gap:
-            return False
-        una = max(self.next_recv_sn, 0)
-        buf = bytearray()
-        for sn in above_gap:
-            buf += build_kcp_segment(
-                cmd=KCP_CMD_ACK,
-                sn=sn,
-                una=una,
-                wnd=KCP_WND,
-                ts=self._ts(),
-            )
-        self.send_func(bytes(buf))
-        return True
+        return False
 
     def skip_gap(self):
         """Skip past ALL persistent gaps to unblock delivery.
@@ -475,9 +460,6 @@ class KcpTunnel:
                 return ("dup", sn)
 
             self.recv_buf[sn] = (seg["frg"], seg["data"])
-            if self.next_recv_sn < 0:
-                self.next_recv_sn = sn
-
             messages = self._drain_receive_buffer()
             self.pending_acks.append((sn, seg["ts"]))
 

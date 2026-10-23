@@ -63,15 +63,15 @@ def test_process_input_delivers_all_pushes_in_compound_datagram():
     tunnel = KcpTunnel(lambda data: None)
     packet = b"".join(
         (
-            build_kcp_segment(KCP_CMD_PUSH, sn=4, frg=0, data=b"first"),
-            build_kcp_segment(KCP_CMD_PUSH, sn=5, frg=0, data=b"second"),
+            build_kcp_segment(KCP_CMD_PUSH, sn=0, frg=0, data=b"first"),
+            build_kcp_segment(KCP_CMD_PUSH, sn=1, frg=0, data=b"second"),
         )
     )
 
     assert tunnel.process_input(packet) == ("data", b"first")
     assert tunnel.poll_data() == b"second"
     assert tunnel.poll_data() is None
-    assert tunnel.pending_acks == [(4, 0), (5, 0)]
+    assert tunnel.pending_acks == [(0, 0), (1, 0)]
 
 
 def test_process_input_handles_all_acks_in_compound_datagram():
@@ -95,8 +95,9 @@ def test_process_input_rejects_entire_malformed_compound_datagram():
     truncated = bytearray(build_kcp_segment(KCP_CMD_PUSH, sn=1, data=b"bad"))
     struct.pack_into("<I", truncated, 0x14, 50)
 
+    expected_sequence_before = tunnel.next_recv_sn
     assert tunnel.process_input(valid + bytes(truncated)) is None
-    assert tunnel.next_recv_sn == -1
+    assert tunnel.next_recv_sn == expected_sequence_before
     assert tunnel.recv_buf == {}
     assert tunnel.pending_acks == []
 
@@ -170,3 +171,18 @@ def test_advertised_window_matches_android_client_capture():
 
     assert KCP_WND == 1024
     assert segment["wnd"] == 1024
+
+
+def test_first_fragmented_message_survives_reverse_datagram_order():
+    tunnel = KcpTunnel(lambda data: None)
+    pieces = [b"first-", b"middle-", b"last"]
+    packets = [struct.pack("<IBBHIIII", 12, 81, 2 - sn, 1024, 0, sn, 0, len(data)) + data
+               for sn, data in enumerate(pieces)]
+    delivered = []
+    for packet in reversed(packets):
+        result = tunnel.process_input(packet)
+        if result and result[0] == "data":
+            delivered.append(result[1])
+        while (message := tunnel.poll_data()) is not None:
+            delivered.append(message)
+    assert delivered == [b"first-middle-last"]

@@ -222,7 +222,7 @@ def test_kcp_bootstrap_uses_only_negotiated_turn_candidate():
         confirmed_peer=None,
     )
 
-    assert turn.relayed == [("172.236.11.156", 22246, b"login")]
+    assert turn.relayed == [("172.236.11.156", 22246, b"login\x00")]
     assert turn.peer_sock.sent == []
 
 
@@ -617,29 +617,6 @@ def test_stream_frame_parser_rejects_truncated_declared_payload(
     assert parse_stream_frame(bytes(frame)) is None
 
 
-def test_refresh_streaming_metadata_uses_current_account_device_values(monkeypatch):
-    client = CloudEdgeClient("user@example.com", "password", "US", "+1")
-    current_account_device = {
-        "serial_number": "ppsl123",
-        "device_id": 1032537077,
-        "host_key": "us-account-host-key",
-        "name": "Camera",
-    }
-    monkeypatch.setattr(client, "get_all_devices", lambda: [current_account_device])
-    stale_device = {
-        "serial_number": "ppsl123",
-        "device_id": 112539302,
-        "host_key": "eu-account-host-key",
-        "name": "Camera",
-    }
-
-    refreshed = client.refresh_streaming_metadata(stale_device)
-
-    assert refreshed is stale_device
-    assert refreshed["device_id"] == 1032537077
-    assert refreshed["host_key"] == "us-account-host-key"
-
-
 def test_wake_dormant_device_falls_back_to_http_wake_without_keepalive_contact():
     api = _NoContactWakeApi()
     sig = _NoContactWakeSig()
@@ -849,7 +826,26 @@ def test_run_session_does_not_retry_after_stop_request(monkeypatch):
     assert calls == ["first.example"]
 
 
-def test_run_session_refreshes_metadata_and_toggles_live_stream_switch(monkeypatch):
+# IoT 167 is FRONT_LIGHT_SWITCH: a live session must leave the user's light
+# alone unless a caller explicitly opts into the legacy toggle.
+@pytest.mark.parametrize(
+    "switch_kwargs,expected_writes",
+    [
+        ({}, []),
+        ({"manage_stream_switch": False}, []),
+        (
+            {"manage_stream_switch": True},
+            [
+                ("ppsl123", {"167": 1}, False, 1032537077),
+                ("ppsl123", {"167": 0}, False, 1032537077),
+            ],
+        ),
+    ],
+    ids=["default", "opt-out", "legacy-opt-in"],
+)
+def test_run_session_refreshes_metadata_and_writes_front_light_only_on_opt_in(
+    monkeypatch, switch_kwargs, expected_writes
+):
     api = _StreamingSwitchApi()
     monkeypatch.setattr(
         "cloudedge.p2p.p2p_streamer._resolve_signaling_candidates",
@@ -866,36 +862,19 @@ def test_run_session_refreshes_metadata_and_toggles_live_stream_switch(monkeypat
             "host_key": "stale-host-key",
             "name": "Camera",
         },
+        **switch_kwargs,
     )
 
     assert streamer.run_session() == (1, 100)
     assert streamer._host_key == "account-region-host-key"
-    assert api.config_calls == [
-        ("ppsl123", {"167": 1}, False, 1032537077),
-        ("ppsl123", {"167": 0}, False, 1032537077),
-    ]
+    assert api.config_calls == expected_writes
 
 
-def test_run_session_can_leave_live_stream_switch_to_caller(monkeypatch):
-    api = _StreamingSwitchApi()
-    monkeypatch.setattr(
-        "cloudedge.p2p.p2p_streamer._resolve_signaling_candidates",
-        lambda api, device=None: [("account-region.example", 28974)],
-    )
-    monkeypatch.setattr("cloudedge.p2p.p2p_streamer.MsgSvrClient", _RunSessionSig)
-    monkeypatch.setattr(P2PStreamer, "_do_stream", lambda self, sig: (1, 100))
+def test_public_streamer_factories_default_to_leaving_front_light_alone():
+    # Public API default: callers that do not pass the flag (examples, CLI,
+    # integrations pinned to older signatures) must not toggle IoT 167.
+    import inspect
 
-    streamer = P2PStreamer(
-        api=api,
-        device={
-            "serial_number": "ppsl123",
-            "device_id": 112539302,
-            "host_key": "stale-host-key",
-            "name": "Camera",
-        },
-        manage_stream_switch=False,
-    )
-
-    assert streamer.run_session() == (1, 100)
-    assert streamer._host_key == "account-region-host-key"
-    assert api.config_calls == []
+    for factory in (CloudEdgeClient.create_streamer, P2PStreamer.__init__):
+        default = inspect.signature(factory).parameters["manage_stream_switch"].default
+        assert default is False, factory.__qualname__
