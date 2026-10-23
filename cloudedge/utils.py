@@ -10,6 +10,56 @@ import requests
 from .exceptions import NetworkError
 
 
+def _url_without_query(url: Any) -> str:
+    """Return the scheme/host/path of a URL, dropping the query string.
+
+    CloudEdge query strings carry signatures and tokens: they must never
+    reach exception messages or logs.
+    """
+    text = str(url or "")
+    return text.split("?", 1)[0]
+
+
+def _sanitize_request_exception(exc: Exception) -> str:
+    """Request failure text that is safe to expose.
+
+    Uses method-free facts only: HTTP status plus URL without query, or the
+    exception class for transport failures. The response body is never
+    included.
+    """
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        return f"HTTP {status} for {_url_without_query(getattr(response, 'url', ''))}"
+    request = getattr(exc, "request", None)
+    if request is not None:
+        return f"{type(exc).__name__} for {_url_without_query(getattr(request, 'url', ''))}"
+    return type(exc).__name__
+
+
+def _safe_exception_text(exc: Exception) -> str:
+    """Exception text safe for messages/logs: sanitized for HTTP requests."""
+    if isinstance(exc, requests.exceptions.RequestException):
+        return _sanitize_request_exception(exc)
+    return str(exc)
+
+
+def _payload_shape(value: Any, depth: int = 0) -> Any:
+    """Structure of a decoded JSON payload for debug logs, never its values.
+
+    Dicts keep their keys, lists become ``list[<length>]`` and scalars their
+    type name: API replies and MQTT pushes carry host keys, device
+    signatures and signed snapshot URLs.
+    """
+    if isinstance(value, dict):
+        if depth >= 4:
+            return f"dict[{len(value)}]"
+        return {str(key): _payload_shape(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, list):
+        return f"list[{len(value)}]"
+    return type(value).__name__
+
+
 def parse_retry_after(response: Any) -> Optional[float]:
     """Parse a ``Retry-After`` header into seconds.
 

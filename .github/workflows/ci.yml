@@ -8,6 +8,8 @@ on:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    # A deadlocked transport test would otherwise hold the runner for 6 hours.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

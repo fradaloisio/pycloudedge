@@ -31,6 +31,8 @@ import logging
 import ssl
 from typing import Any, Callable, Dict, Optional
 
+from .utils import _payload_shape
+
 _LOGGER = logging.getLogger(__name__)
 
 ALARM_TYPE_NAMES: Dict[int, str] = {
@@ -114,6 +116,35 @@ class CloudEdgeMqttListener:
         self._client: Any = None
         self._connected = False
         self._verify_tls = verify_tls
+        self._ce_client = client
+        self._stopping = False
+
+    def _renew_credentials(self, paho_client: Any) -> None:
+        """Before paho reconnects, pick up credentials renewed by the client.
+
+        Platform credentials expire and are replaced by the CloudEdge client
+        (401 renewal, refresh_mqtt_config). paho reconnects with whatever was
+        last passed to username_pw_set, so stale ones would be refused forever.
+        Runs in the paho thread while disconnected; refresh_mqtt_config only
+        performs I/O (throttled) when the cached config is unusable. Skipped
+        once :meth:`stop` began: a deliberate disconnect needs no renewal.
+        Never call :meth:`stop` while holding the CloudEdge client's lock.
+        """
+        if self._stopping:
+            return
+        try:
+            refresh = getattr(self._ce_client, "refresh_mqtt_config", None)
+            cfg = refresh() if callable(refresh) else self._ce_client.get_mqtt_config()
+        except Exception as exc:
+            _LOGGER.debug("MQTT credential renewal failed: %s", exc)
+            return
+        if not cfg:
+            return
+        creds = (cfg.get("mqtt_access_id"), cfg.get("mqtt_signature"))
+        if all(creds) and creds != (self._username, self._password):
+            self._username, self._password = creds
+            paho_client.username_pw_set(*creds)
+            _LOGGER.info("MQTT credentials renewed; next reconnect uses them")
 
     @property
     def connected(self) -> bool:
@@ -137,6 +168,7 @@ class CloudEdgeMqttListener:
             raise ImportError(
                 "paho-mqtt is required for MQTT support: pip install paho-mqtt"
             )
+        self._stopping = False
 
         def _on_connect(client, userdata, flags, rc, *args):
             # paho-mqtt v2 passes rc as ReasonCode object, not int
@@ -151,8 +183,20 @@ class CloudEdgeMqttListener:
                 _LOGGER.warning("MQTT connect failed: rc=%s", rc)
 
         def _on_disconnect(client, userdata, *args):
+            # paho v2: (flags, reason_code, properties); v1: (rc,)
             self._connected = False
-            _LOGGER.debug("MQTT disconnected")
+            reason = args[1] if len(args) >= 2 else (args[0] if args else None)
+            from_server = (
+                getattr(args[0], "is_disconnect_packet_from_server", None)
+                if args
+                else None
+            )
+            _LOGGER.info(
+                "MQTT disconnected: reason=%s from_server_packet=%s",
+                reason,
+                from_server,
+            )
+            self._renew_credentials(client)
             if self._on_disconnect_cb:
                 self._on_disconnect_cb()
 
@@ -183,12 +227,17 @@ class CloudEdgeMqttListener:
         client.on_connect = _on_connect
         client.on_disconnect = _on_disconnect
         client.on_message = _on_message
-        client.reconnect_delay_set(min_delay=3, max_delay=60)
+        # The EU broker ends every connection ~300 s after CONNECT; reconnect
+        # quickly so the push-event gap stays ~1 s instead of ~3 s.
+        client.reconnect_delay_set(min_delay=1, max_delay=60)
+        client.enable_logger(logging.getLogger(f"{__name__}.paho"))
 
         self._client = client
 
         try:
-            client.connect_async(self._host, self._port, keepalive=300)
+            # The app pings after 120 s; a 300 s keepalive never sends a
+            # PINGREQ before the broker's ~300 s cutoff.
+            client.connect_async(self._host, self._port, keepalive=60)
             client.loop_start()
             return True
         except Exception as exc:
@@ -219,6 +268,7 @@ class CloudEdgeMqttListener:
     def stop(self) -> None:
         """Stop the MQTT background loop and disconnect."""
         if self._client:
+            self._stopping = True
             try:
                 self._client.loop_stop()
                 self._client.disconnect()
@@ -234,7 +284,9 @@ class CloudEdgeMqttListener:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
 
-        _LOGGER.debug("MQTT raw payload: %s", json.dumps(data, default=str)[:2000])
+        # Structure only: alarm pushes carry signed snapshot URLs, which are
+        # bearer links. The decoded event, device and bool(url) follow below.
+        _LOGGER.debug("MQTT payload shape: %s", str(_payload_shape(data))[:2000])
 
         original = data
 

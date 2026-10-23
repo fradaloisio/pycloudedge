@@ -15,13 +15,14 @@ Wire frame format:
   [6]    len_lo       payload length low byte
   [7]    len_hi|enc   payload length high 7 bits + bit7=encrypted
   [8..N] payload      3DES-ECB encrypted JSON (PKCS5 padded)
-  [N+1]  checksum     XOR of all payload bytes
+  [N+1]  checksum     sum of all payload bytes & 0xFF
   [N+2]  0x9D         tail marker
 
 Encryption: 3DES ECB with key "__#!HIRCloud5.0!#__" (padded to 24 bytes with zeros).
 """
 
 import base64
+import collections
 import json
 import socket
 import time
@@ -96,39 +97,35 @@ def _build_frame(node, method, cmd, payload_json, encrypt=True):
     header[6] = payload_len & 0xFF
     header[7] = ((payload_len >> 8) & 0x7F) | (0x80 if encrypt else 0x00)
 
-    checksum = 0
-    for b in payload:
-        checksum ^= b
+    # The app and msgsvr use the additive checksum (as root_discovery does).
+    checksum = sum(payload) & 0xFF
 
-    return bytes(header) + payload + bytes([checksum & 0xFF, TAIL])
-
-
-def _recv_exact(sock, n):
-    """Receive exactly n bytes."""
-    data = b""
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-        if not chunk:
-            raise ConnectionError(f"Connection closed (got {len(data)}/{n})")
-        data += chunk
-    return data
+    return bytes(header) + payload + bytes([checksum, TAIL])
 
 
-def _recv_frame(sock):
-    """Receive and parse one msgsvr frame."""
-    header = _recv_exact(sock, 8)
-    if header[0] != MAGIC or header[5] != MAGIC:
-        raise ValueError(f"Invalid header magic: {header.hex()}")
+def _take_frame(buffer):
+    """Remove and parse the first complete frame in ``buffer``, or None."""
+    if len(buffer) < 8:
+        return None
+    if buffer[0] != MAGIC or buffer[5] != MAGIC:
+        raise ValueError(f"Invalid header magic: {bytes(buffer[:8]).hex()}")
+    # Header, payload, checksum byte and tail byte.
+    end = 8 + (buffer[6] | ((buffer[7] & 0x7F) << 8)) + 2
+    if len(buffer) < end:
+        return None
+    header, rest = bytes(buffer[:8]), bytes(buffer[8:end])
+    del buffer[:end]
+    return _parse_frame(header, rest)
 
+
+def _parse_frame(header, rest):
+    """Parse a frame from its header and payload + checksum + tail bytes."""
     node = header[1]
     method = header[2]
     cmd = header[3]
 
     payload_len = header[6] | ((header[7] & 0x7F) << 8)
     is_encrypted = bool(header[7] & 0x80)
-
-    # Read payload + checksum byte + tail byte
-    rest = _recv_exact(sock, payload_len + 2)
     payload = rest[:payload_len]
 
     if is_encrypted and payload_len > 0:
@@ -162,6 +159,13 @@ class MsgSvrClient:
         self.uuid = None
         self.token = None
         self.webrtcsvr = None  # {ip, port, domain, tag}
+        # Unsolicited msgsvr status pushes (cmd 0xC7) that arrived while a
+        # request was waiting for a different reply.
+        self.pending_status = collections.deque(maxlen=16)
+        # Bytes received but not yet parsed into a frame.  Every read goes
+        # through this buffer, so a frame split across TCP segments (or cut
+        # by a timeout) is completed by the next read instead of desyncing.
+        self._rx = bytearray()
 
     def connect(self):
         """TCP connect to signaling server."""
@@ -176,8 +180,66 @@ class MsgSvrClient:
         self.sock.sendall(frame)
 
     def _recv(self):
-        """Receive one frame."""
-        return _recv_frame(self.sock)
+        """Receive one frame (each socket read honours the socket timeout)."""
+        while True:
+            frame = _take_frame(self._rx)
+            if frame is not None:
+                return frame
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("msgsvr closed the connection")
+            self._rx += chunk
+
+    def _queue_status(self, frame):
+        """Keep an unsolicited status push (cmd 0xC7) for later consumers."""
+        data = frame.get("json")
+        if frame["cmd"] == CMD_STATUS and isinstance(data, dict):
+            self.pending_status.append(data)
+
+    def _recv_cmd(self, expected_cmd, max_frames=16):
+        """Receive the next frame for ``expected_cmd``.
+
+        Status pushes are queued for later consumers; other unrelated
+        frames (late connect acks, heartbeat replies) are dropped.
+        """
+        for _ in range(max_frames):
+            resp = self._recv()
+            if resp["cmd"] == expected_cmd:
+                return resp
+            self._queue_status(resp)
+        raise RuntimeError(f"No reply for cmd 0x{expected_cmd:02x}")
+
+    def drain_frames(self, max_frames=64):
+        """Consume the frames that already arrived, without blocking.
+
+        Used while a session streams: status pushes are queued in
+        ``pending_status``; keepalive replies (heartbeat, hello) and other
+        frames are dropped.  Returns the number of frames consumed and
+        raises ConnectionError when msgsvr closed the connection.
+        """
+        previous_timeout = self.sock.gettimeout()
+        self.sock.settimeout(0.0)
+        try:
+            while True:
+                try:
+                    chunk = self.sock.recv(4096)
+                except (BlockingIOError, InterruptedError, socket.timeout):
+                    break
+                if not chunk:
+                    raise ConnectionError("msgsvr closed the connection")
+                self._rx += chunk
+                if len(self._rx) >= 65536:
+                    break
+        finally:
+            self.sock.settimeout(previous_timeout)
+        consumed = 0
+        while consumed < max_frames:
+            frame = _take_frame(self._rx)
+            if frame is None:
+                break
+            self._queue_status(frame)
+            consumed += 1
+        return consumed
 
     def _send_webrtc(self, inner_json, to_webrtcsvr=True):
         """Send a webrtcsvr-routed message with base64-encoded content."""
@@ -212,7 +274,7 @@ class MsgSvrClient:
 
     def _recv_webrtc_content(self):
         """Receive a webrtcsvr response and decode the inner content."""
-        resp = self._recv()
+        resp = self._recv_cmd(CMD_WEBRTC)
         if resp["json"] and "content" in resp["json"]:
             inner_b64 = resp["json"]["content"]
             return json.loads(base64.b64decode(inner_b64))
@@ -246,6 +308,28 @@ class MsgSvrClient:
         self.uuid = data["uuid"]
         self.token = data["token"]
         return data
+
+    def send_heartbeat(self, runtime=0):
+        """Registration keepalive (cmd 0xC9), every register-reply ``hb`` s.
+
+        Same body as the app's: the register reply's uuid and token, the
+        register ``ver`` and the seconds since registration.  msgsvr answers
+        on cmd 0xC9; drain_frames() discards the reply.
+        """
+        self._send(METHOD_DIRECT, CMD_HEARTBEAT, json.dumps({
+            "uuid": self.uuid,
+            "token": self.token,
+            "ver": 15340,
+            "runtime": int(runtime),
+        }, separators=(",", ":")))
+
+    def send_hello(self):
+        """Routed webrtcsvr hello, the app's ~21 s keepalive while streaming.
+
+        msgsvr answers with a hello carrying a fresh tag; drain_frames()
+        discards the reply.
+        """
+        self._send_webrtc({"cmd": "hello"})
 
     def webrtc_hello(self):
         """Step 2: Hello to webrtcsvr, get tag for later SDP exchange."""
@@ -304,6 +388,17 @@ class MsgSvrClient:
 
     def send_wake_connect(self, device_uuid, device_contact, local_ips, local_port):
         """Step 4: Send connection/wake request to device."""
+        # The status reply's keepalive names the camera's NAT server
+        # (node natsvr); the app addresses the camera itself and only reuses
+        # the keepalive endpoint.
+        device_contact = {
+            "node": "dev",
+            "domain": device_uuid,
+            "transport": device_contact.get("transport", "tcp"),
+            "type": device_contact.get("type", "binary"),
+            "ip": device_contact.get("ip"),
+            "port": device_contact.get("port"),
+        }
         sid = uuid_mod.uuid4().hex[:16]
         msg = json.dumps({
             "sid": sid,
@@ -322,7 +417,12 @@ class MsgSvrClient:
         }, separators=(",", ":"))
 
         self._send(METHOD_DIRECT, CMD_CONNECT, msg)
-        resp = self._recv()
+        try:
+            resp = self._recv()
+        except socket.timeout:
+            return None
+        if resp["cmd"] == CMD_STATUS and isinstance(resp.get("json"), dict):
+            self.pending_status.append(resp["json"])
         return resp["json"]
 
     def request_coturn(self, device_uuid):
@@ -382,6 +482,11 @@ class MsgSvrClient:
 
     def wait_for_status(self, device_uuid, target="online", timeout=30):
         """Wait for device status to change (e.g., dormancy -> online)."""
+        while self.pending_status:
+            data = self.pending_status.popleft()
+            if (data.get("action") == "status" and data.get("uuid") == device_uuid
+                    and data.get("status", "") == target):
+                return data
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.sock.settimeout(max(1, deadline - time.time()))

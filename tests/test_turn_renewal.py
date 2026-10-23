@@ -6,6 +6,13 @@ the channel number already bound to the peer, no longer depend on the UDP
 receive queue being empty, and a refused renewal raises a typed error so the
 caller can rebuild the session.
 
+C83/C84 narrow that contract to relayed media: like the vendor app, a
+session whose confirmed media path is direct stops renewing TURN (no
+deallocation; the allocation expires on the server), so a TURN refusal or
+outage ends relay sessions only, and the next renewal deadline counts from
+when renew_due() returns.  C74 — a rotated nonce (438 Stale Nonce) is
+adopted and the request repeated once.
+
 V02 — every socket acquired by the TURN setup path (connect / allocate /
 peer_stun_binding) is closed deterministically when a later setup step
 raises.
@@ -17,6 +24,8 @@ a pre-fix run of this module reports each behavioural regression separately
 instead of dying at collection time.
 """
 
+import hashlib
+import hmac
 import socket
 import struct
 from types import SimpleNamespace
@@ -30,6 +39,7 @@ from cloudedge.p2p.turn_client import (
     ATTR_CHANNEL_NUMBER,
     ATTR_ERROR_CODE,
     ATTR_LIFETIME,
+    ATTR_MESSAGE_INTEGRITY,
     ATTR_NONCE,
     ATTR_REALM,
     ATTR_USERNAME,
@@ -95,6 +105,10 @@ class FakeTurnSocket:
     def recvfrom(self, bufsize):
         if self is not self._server.control:
             raise socket.timeout("peer-media socket has no scripted traffic")
+        if self._server.muted:
+            # TURN/WAN outage: the wait runs to the socket timeout.
+            self._server.clock.advance(self.timeout)
+            raise socket.timeout("TURN server unreachable")
         response = self._server.respond()
         if response is None:
             raise socket.timeout("no scripted response")
@@ -119,7 +133,15 @@ class ScriptedTurnServer:
         self.sockets = []
         self.control = None
         self.refuse_refresh = False
+        self.muted = False
         self.granted_lifetime = 600
+        # Nonce rotation like coturn (STUN_DEFAULT_NONCE_EXPIRATION_TIME is
+        # 600 s); None keeps one nonce for the whole test.
+        self.nonce = b"nonce-123"
+        self.nonce_lifetime = None
+        self.nonce_issued_at = clock()
+        self.nonce_serial = 0
+        self.integrity_failures = 0
 
     def socket_factory(self, *args):
         sock = FakeTurnSocket(self)
@@ -133,6 +155,7 @@ class ScriptedTurnServer:
             return
         parsed = _parse_stun(data)
         if parsed is not None:
+            parsed["raw"] = data
             self.pending.append(parsed)
 
     def respond(self):
@@ -143,13 +166,33 @@ class ScriptedTurnServer:
         txn_id = request["txn_id"]
         attrs = request["attrs"]
 
+        if ATTR_USERNAME in attrs:
+            if not _integrity_ok(request["raw"], b"user", b"hangzhou", b"password"):
+                self.integrity_failures += 1
+            if (
+                self.nonce_lifetime is not None
+                and self.clock() - self.nonce_issued_at >= self.nonce_lifetime
+            ):
+                self.nonce_serial += 1
+                self.nonce = b"nonce-%d" % self.nonce_serial
+                self.nonce_issued_at = self.clock()
+            if attrs.get(ATTR_NONCE) != self.nonce:
+                payload = _encode_attr(
+                    ATTR_ERROR_CODE, b"\x00\x00\x04\x26 Stale Nonce"
+                )
+                payload += _encode_attr(ATTR_REALM, b"hangzhou")
+                payload += _encode_attr(ATTR_NONCE, self.nonce)
+                self.events.append((self.clock(), "stale_nonce", (msg_type, txn_id)))
+                return _build_stun(msg_type | 0x0110, payload, txn_id)[0]
+            self.events.append((self.clock(), "accepted", (msg_type, txn_id)))
+
         if msg_type == ALLOCATE_REQUEST:
             if ATTR_USERNAME not in attrs:  # unauthenticated probe -> 401
                 payload = _encode_attr(
                     ATTR_ERROR_CODE, b"\x00\x00\x04\x01 Unauthorized"
                 )
                 payload += _encode_attr(ATTR_REALM, b"hangzhou")
-                payload += _encode_attr(ATTR_NONCE, b"nonce-123")
+                payload += _encode_attr(ATTR_NONCE, self.nonce)
                 self.events.append((self.clock(), "allocate_challenge", None))
                 return _build_stun(msg_type | 0x0110, payload, txn_id)[0]
             payload = _encode_attr(
@@ -193,6 +236,21 @@ class ScriptedTurnServer:
             return _build_stun(msg_type | 0x0100, b"", txn_id)[0]
 
         return _build_stun(msg_type | 0x0100, b"", txn_id)[0]
+
+
+def _integrity_ok(raw, username, realm, password):
+    """Check MESSAGE-INTEGRITY with the long-term key (RFC 8489 §14.5)."""
+    key = hashlib.md5(username + b":" + realm + b":" + password).digest()
+    length = struct.unpack_from(">H", raw, 2)[0]
+    pos = 20
+    while pos + 4 <= 20 + length:
+        attr_type, attr_length = struct.unpack_from(">HH", raw, pos)
+        if attr_type == ATTR_MESSAGE_INTEGRITY:
+            header = raw[:2] + struct.pack(">H", pos - 20 + 24) + raw[4:20]
+            expected = hmac.new(key, header + raw[20:pos], hashlib.sha1).digest()
+            return raw[pos + 4 : pos + 24] == expected
+        pos += 4 + ((attr_length + 3) & ~3)
+    return False
 
 
 @pytest.fixture
@@ -329,13 +387,20 @@ class FakeKcp:
     def send_iva_data(self, payload):
         self.sent.append(payload)
 
+    def retransmit_unacked(self):
+        return None
+
     def skip_gap(self):
         return False
 
     def process_input(self, data):
-        # Yields one benign frame per datagram so the receiver's idle
-        # timeout does not fire; no real KCP logic is needed here.
-        return ("data", b"\x00\x00\x01\x08keepalive")
+        # Keep the simulated camera delivering video while exercising TURN
+        # renewal ownership. Empty live sessions now correctly time out.
+        frame = bytearray(64)
+        frame[:4] = b"\x00\x00\x01\xfc"
+        struct.pack_into("<I", frame, 56, 4)
+        frame[60:] = b"live"
+        return ("data", bytes(frame))
 
 
 def _kcp_keepalive_datagram():
@@ -379,7 +444,9 @@ def _make_streamer():
     )
 
 
-def _run_receive_stream(monkeypatch, turn, clock, *, packets_per_poll, duration=700.0):
+def _run_receive_stream(
+    monkeypatch, turn, clock, *, packets_per_poll, duration=700.0, **receive_kwargs
+):
     """Drive _receive_stream over `duration` simulated seconds.
 
     packets_per_poll > 0 models continuous traffic: the receive buffer is
@@ -436,6 +503,7 @@ def _run_receive_stream(monkeypatch, turn, clock, *, packets_per_poll, duration=
         video_count_start=0,
         bytes_start=0,
         start_time=start,
+        **receive_kwargs,
     )
     return counts, start
 
@@ -479,7 +547,8 @@ def test_receive_stream_renews_turn_under_continuous_traffic(
         assert {channel for _, channel in binds} == {
             turn.channels[("203.0.113.10", 6000)]
         }, "renewal must reuse the peer's channel number"
-        assert counts == (0, 0)
+        assert counts[0] > 0
+        assert counts[1] == counts[0] * 4
     finally:
         turn.close()
 
@@ -521,7 +590,8 @@ def test_receive_stream_renews_turn_without_continuous_traffic(
         assert {channel for _, channel in binds} == {
             turn.channels[("203.0.113.10", 6000)]
         }
-        assert counts == (0, 0)
+        assert counts[0] > 0
+        assert counts[1] == counts[0] * 4
     finally:
         turn.close()
 
@@ -543,13 +613,234 @@ def test_receive_stream_ends_session_when_renewal_is_refused(
 
         refused = [e for e in server.events if e[1] == "refresh_refused"]
         assert refused, "the refusal must be observable"
-        assert counts == (0, 0)
+        assert counts[0] > 0
+        assert counts[1] == counts[0] * 4
         assert clock() - start < 200, (
             "a refused renewal must end the session promptly so the caller "
             "can rebuild it, not be silently ignored"
         )
     finally:
         turn.close()
+
+
+# ----------------------------------------------------------------------
+# C83/C84 — renewals only while media is relayed, deadline after the call
+# ----------------------------------------------------------------------
+
+CAMERA_HOST = ("192.168.1.30", 40000)
+CAMERA_RELAY = ("198.51.100.99", 5555)
+RENEWAL_KINDS = ("refresh", "refresh_refused", "permission", "channel_bind")
+
+
+def _push(sn, payload):
+    # Independent KCP wire format, rather than the production encoder.
+    return struct.pack("<IBBHIIII", 12, 81, 0, 1024, 0, sn, 0, len(payload)) + payload
+
+
+def _video_frame():
+    frame = bytearray(64)
+    frame[:4] = b"\x00\x00\x01\xfc"
+    struct.pack_into("<I", frame, 56, 4)
+    frame[60:] = b"live"
+    return bytes(frame)
+
+
+class _MediaSignaling:
+    sock = SimpleNamespace(settimeout=lambda seconds: None)
+    pending_status = ()
+
+    def send_offer(self, device_uuid, sdp):
+        return {"sdp": (
+            "a=ice-ufrag:cam\na=ice-pwd:secret\nm=audio 5555 RTP / AVP 0\n"
+            "c=IN IP4 198.51.100.99\n"
+            "a=candidate:H 1 UDP 1694498815 192.168.1.30 40000 typ host\n"
+        )}
+
+    def _recv_webrtc_content(self):
+        raise socket.timeout()
+
+    def send_candidate_complete(self, device_uuid):
+        return {}
+
+
+def _run_stream_with_turn(monkeypatch, turn, clock, *, relayed, duration):
+    """Drive the connection loop with a camera streaming on one media path."""
+    streamer = _make_streamer()
+    streamer._running = True
+    frames = []
+    streamer.on_video = frames.append
+    monkeypatch.setattr(p2p_streamer, "time", SimpleNamespace(
+        time=lambda: clock.now, monotonic=lambda: clock.now, sleep=lambda s: None,
+    ))
+    monkeypatch.setattr(p2p_streamer, "_get_local_ips", lambda: ["192.168.1.2"])
+    start = clock()
+    sn = [0]
+
+    def receive_batch(turn_arg, timeout, limit=2000):
+        clock.advance(0.1)
+        if clock() - start >= duration:
+            streamer.request_stop()
+        kcp = _push(sn[0], b"login-accepted" if sn[0] == 0 else _video_frame())
+        sn[0] += 1
+        if relayed:
+            channel = turn.channels[CAMERA_RELAY]
+            datagram = struct.pack(">HH", channel, len(kcp)) + kcp
+            return [(datagram, (turn.server_ip, turn.server_port), True)]
+        return [(kcp, CAMERA_HOST, False)]
+
+    monkeypatch.setattr(p2p_streamer, "_recv_udp_batch", receive_batch)
+    counts = streamer._stream_with_turn(
+        _MediaSignaling(), turn, "device-uuid", streamer._host_key,
+        streamer._sn_num, {}, turn.server_ip, False,
+    )
+    return counts, start, frames
+
+
+def test_direct_session_stops_renewing_turn_and_survives_a_refusal(
+    monkeypatch, turn_env
+):
+    clock = turn_env.clock
+    server = turn_env.server
+    turn = _connected_turn(clock)
+    try:
+        server.refuse_refresh = True
+        counts, start, frames = _run_stream_with_turn(
+            monkeypatch, turn, clock, relayed=False, duration=700
+        )
+    finally:
+        turn.close()
+
+    assert clock() - start >= 700, "a TURN-only refusal must not end direct media"
+    assert counts[0] > 6000
+    renewals = [e for e in server.events if e[0] > start and e[1] in RENEWAL_KINDS]
+    assert renewals == [], "no TURN renewals while media is direct"
+
+
+def test_relayed_session_still_ends_when_a_renewal_is_refused(monkeypatch, turn_env):
+    clock = turn_env.clock
+    server = turn_env.server
+    turn = _connected_turn(clock)
+    try:
+        server.refuse_refresh = True
+        counts, start, _ = _run_stream_with_turn(
+            monkeypatch, turn, clock, relayed=True, duration=700
+        )
+    finally:
+        turn.close()
+
+    assert counts[0] > 0
+    assert clock() - start < 200, "relay sessions keep the F06 contract"
+    assert [e for e in server.events if e[0] > start and e[1] == "refresh_refused"]
+
+
+def test_receive_stream_defers_renewals_on_a_direct_path(monkeypatch, turn_env):
+    clock = turn_env.clock
+    server = turn_env.server
+    turn = _connected_turn(clock)
+    try:
+        turn.create_permission("203.0.113.10")
+        turn.channel_bind("203.0.113.10", 6000)
+        clock.advance(1.0)
+        server.refuse_refresh = True
+
+        counts, start = _run_receive_stream(
+            monkeypatch, turn, clock, packets_per_poll=4,
+            confirmed_peer=("203.0.113.10", 6000, True),
+        )
+    finally:
+        turn.close()
+
+    assert clock() - start >= 700
+    assert [e for e in server.events if e[0] > start and e[1] in RENEWAL_KINDS] == []
+
+
+def test_renewal_deadline_counts_from_after_a_blocked_renewal(monkeypatch, turn_env):
+    clock = turn_env.clock
+    server = turn_env.server
+    turn = _connected_turn(clock)
+    calls = []
+    renew_due = turn.renew_due
+
+    def timed_renew_due(*args, **kwargs):
+        began = clock()
+        try:
+            return renew_due(*args, **kwargs)
+        finally:
+            calls.append((began, clock()))
+
+    turn.renew_due = timed_renew_due
+    try:
+        turn.create_permission("203.0.113.10")
+        clock.advance(1.0)
+        server.muted = True  # TURN outage: every transaction waits 3 s
+
+        _run_receive_stream(
+            monkeypatch, turn, clock, packets_per_poll=4, duration=120.0
+        )
+    finally:
+        turn.close()
+
+    assert len(calls) >= 3
+    blocked = [ended - began for began, ended in calls]
+    assert all(seconds >= 3.0 for seconds in blocked)
+    gaps = [later[0] - earlier[1] for earlier, later in zip(calls, calls[1:])]
+    # renew_due() asks for a retry in 5 s; counted from before the 3 s
+    # block, the next renewal would start 2 s after it returned and starve
+    # the media loop in back-to-back blocking transactions.
+    assert min(gaps) >= 4.5
+
+
+# ----------------------------------------------------------------------
+# C74 — a rotated nonce (438 Stale Nonce) is renewed, not fatal
+# ----------------------------------------------------------------------
+
+
+def test_renewals_retry_once_with_each_rotated_nonce(turn_env):
+    clock = turn_env.clock
+    server = turn_env.server
+    server.nonce_lifetime = 600  # coturn's default nonce lifetime
+    turn = _connected_turn(clock)
+    try:
+        turn.create_permission("203.0.113.10")
+        turn.channel_bind("203.0.113.10", 6000)
+        start = clock()
+        renewal_at = clock() + 60
+        while clock() - start < 1300:
+            clock.advance(0.5)
+            if clock() >= renewal_at:
+                renewal_at = clock() + turn.renew_due()
+    finally:
+        turn.close()
+
+    events = _session_events(server, start)
+    stale = [(at, detail) for at, kind, detail in events if kind == "stale_nonce"]
+    accepted = [(at, detail) for at, kind, detail in events if kind == "accepted"]
+    assert len(stale) >= 2, "the nonce rotated at 600 and 1200 s"
+    for at, (msg_type, txn_id) in stale:
+        retries = [d for t, d in accepted if t == at and d[0] == msg_type]
+        assert retries, "a stale request is repeated at once"
+        assert all(d[1] != txn_id for d in retries), "with a new transaction"
+    refresh_times = [at for at, kind, _ in events if kind == "refresh"]
+    assert refresh_times[-1] - start > 1200, "renewals continue past each rotation"
+    assert turn.nonce == server.nonce
+    assert server.integrity_failures == 0, "every retry is signed with the new nonce"
+
+
+def test_refresh_gives_up_when_the_retry_is_refused_too(turn_env):
+    from cloudedge.p2p.turn_client import TurnRenewalRefusedError
+
+    clock = turn_env.clock
+    server = turn_env.server
+    turn = _connected_turn(clock)
+    try:
+        server.nonce_lifetime = 0  # every request finds its nonce stale
+        clock.advance(1)
+        with pytest.raises(TurnRenewalRefusedError, match="438"):
+            turn.refresh()
+    finally:
+        turn.close()
+
+    assert len([e for e in server.events if e[1] == "stale_nonce"]) == 2
 
 
 # ----------------------------------------------------------------------
