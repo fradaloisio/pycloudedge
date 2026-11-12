@@ -43,6 +43,7 @@ from .iot_parameters import (
     format_parameter_value
 )
 from .constants import (
+    APP_VERSION, APP_VERSION_CODE,
     CA_KEY, CA_SECRET, DEFAULT_HEADERS, DEFAULT_TIMEOUT,
     REDIRECT_URL, SESSION_INVALID_RESULT_CODES,
 )
@@ -1033,8 +1034,8 @@ class CloudEdgeClient:
         params = {
             "phoneType": "a",
             "sourceApp": "8",
-            "appVer": "6.2.8",
-            "appVerCode": "643",
+            "appVer": APP_VERSION,
+            "appVerCode": APP_VERSION_CODE,
             "localTime": str(timestamp),
             "t": str(timestamp),
             "lngType": "en",
@@ -1188,8 +1189,8 @@ class CloudEdgeClient:
         
         # Create signature
         ca_sign_data = (
-            f"phoneType=a&sourceApp=8&appVer=6.2.8&iotType=4&equipmentNo= &"
-            f"appVerCode=643&localTime={timestamp}&password={encrypted_password}&"
+            f"phoneType=a&sourceApp=8&appVer={APP_VERSION}&iotType=4&equipmentNo= &"
+            f"appVerCode={APP_VERSION_CODE}&localTime={timestamp}&password={encrypted_password}&"
             f"t={timestamp}&lngType=en&countryCode={self.country_code}&"
             f"userAccount={encrypted_username}&encryStatus=1&"
             f"phoneCode={phone_code_bare}"
@@ -1201,10 +1202,10 @@ class CloudEdgeClient:
         login_data = {
             "phoneType": "a",
             "sourceApp": "8",
-            "appVer": "6.2.8",
+            "appVer": APP_VERSION,
             "iotType": "4",
             "equipmentNo": " ",
-            "appVerCode": "643",
+            "appVerCode": APP_VERSION_CODE,
             "localTime": timestamp,
             "password": encrypted_password,
             "t": timestamp,
@@ -1344,7 +1345,7 @@ class CloudEdgeClient:
             ts = int(time.time() * 1000)
 
             params = {
-                'appVer': '6.2.8', 'appVerCode': '643', 'lngType': 'en',
+                'appVer': APP_VERSION, 'appVerCode': APP_VERSION_CODE, 'lngType': 'en',
                 'phoneType': 'a', 'sdkVer': '1.0.0', 'sourceApp': '8',
                 'countryCode': self.country_code,
                 'phoneCode': self.phone_code,
@@ -1507,8 +1508,8 @@ class CloudEdgeClient:
             raise AuthenticationError("Not authenticated")
             
         body = {
-            'appVer': '6.2.8',
-            'appVerCode': '643',
+            'appVer': APP_VERSION,
+            'appVerCode': APP_VERSION_CODE,
             'lngType': 'en',
             'phoneType': 'a',
             'sdkVer': '1.0.0',
@@ -1543,7 +1544,7 @@ class CloudEdgeClient:
         nonce = int(time.time())
         
         params_str = (
-            f"appVer=6.2.8&appVerCode=643&lngType=en&phoneType=a&"
+            f"appVer={APP_VERSION}&appVerCode={APP_VERSION_CODE}&lngType=en&phoneType=a&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
             f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
             f"userID={self.session_data['userID']}"
@@ -1645,7 +1646,7 @@ class CloudEdgeClient:
         nonce = int(time.time())
         
         params_str = (
-            f"appVer=6.2.8&appVerCode=643&homeID={home_id}&lngType=en&phoneType=a&"
+            f"appVer={APP_VERSION}&appVerCode={APP_VERSION_CODE}&homeID={home_id}&lngType=en&phoneType=a&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
             f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
             f"userID={self.session_data['userID']}"
