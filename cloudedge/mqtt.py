@@ -26,6 +26,7 @@ Usage::
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import ssl
@@ -159,6 +160,11 @@ class CloudEdgeMqttListener:
     def start(self) -> bool:
         """Start the MQTT background loop (non-blocking).
 
+        Calling it on a listener that is already started restarts it: the
+        previous client is stopped first, as :meth:`stop` does (waiting for
+        its network thread to end), so a listener never keeps more than one
+        connection open under its client id.
+
         Returns ``True`` if the connection was initiated successfully.
         Raises ``ImportError`` if ``paho-mqtt`` is not installed.
         """
@@ -168,6 +174,10 @@ class CloudEdgeMqttListener:
             raise ImportError(
                 "paho-mqtt is required for MQTT support: pip install paho-mqtt"
             )
+        # A second client with the same client id takes the broker session
+        # over from the first, whose loop reconnects and takes it back; and
+        # stop() could only ever reach the newer one.
+        self.stop()
         self._stopping = False
 
         def _on_connect(client, userdata, flags, rc, *args):
@@ -177,8 +187,7 @@ class CloudEdgeMqttListener:
                 self._connected = True
                 client.subscribe(self._topic, qos=2)
                 _LOGGER.info("MQTT connected — topic: %s", self._topic)
-                if self._on_connect_cb:
-                    self._on_connect_cb()
+                self._call_host(self._on_connect_cb, "on_connect")
             else:
                 _LOGGER.warning("MQTT connect failed: rc=%s", rc)
 
@@ -197,8 +206,7 @@ class CloudEdgeMqttListener:
                 from_server,
             )
             self._renew_credentials(client)
-            if self._on_disconnect_cb:
-                self._on_disconnect_cb()
+            self._call_host(self._on_disconnect_cb, "on_disconnect")
 
         def _on_message(client, userdata, msg):
             try:
@@ -337,24 +345,48 @@ class CloudEdgeMqttListener:
             evt_name, device_id, is_motion, bool(extra.get("url")),
         )
 
+        args = (device_id, evt_name, evt_int, is_motion, extra)
         if self.on_event:
-            try:
-                self.on_event(device_id, evt_name, evt_int, is_motion, extra)
-            except TypeError:
-                try:
-                    self.on_event(device_id, evt_name, evt_int, is_motion)
-                except Exception as exc:
-                    _LOGGER.debug("on_event callback error: %s", exc)
-            except Exception as exc:
-                _LOGGER.debug("on_event callback error: %s", exc)
+            self._call_event_callback(self.on_event, args, "on_event")
 
         if is_motion and self.on_motion:
-            try:
-                self.on_motion(device_id, evt_name, evt_int, is_motion, extra)
-            except TypeError:
-                try:
-                    self.on_motion(device_id, evt_name, evt_int, is_motion)
-                except Exception as exc:
-                    _LOGGER.debug("on_motion callback error: %s", exc)
-            except Exception as exc:
-                _LOGGER.debug("on_motion callback error: %s", exc)
+            self._call_event_callback(self.on_motion, args, "on_motion")
+
+    @staticmethod
+    def _call_event_callback(
+        callback: Callable[..., Any], args: tuple, name: str
+    ) -> None:
+        """Call an event callback exactly once, in the form it takes.
+
+        ``extra`` is passed only if the callback's signature accepts a fifth
+        argument. The form is read from the signature instead of retrying
+        with four arguments on ``TypeError``: a ``TypeError`` raised inside
+        the callback would then process the event twice.
+        """
+        try:
+            inspect.signature(callback).bind(*args)
+        except TypeError:
+            args = args[:4]  # legacy four-argument callback
+        except Exception:
+            # No readable signature (some builtins; from Python 3.14 an
+            # annotation naming an undefined type): assume the extended form.
+            pass
+        try:
+            callback(*args)
+        except Exception as exc:
+            _LOGGER.debug("%s callback error: %s", name, exc)
+
+    @staticmethod
+    def _call_host(callback: Optional[Callable[[], None]], name: str) -> None:
+        """Run the host's on_connect/on_disconnect callback, if any.
+
+        It runs in paho's network thread, and paho 2.x re-raises there what
+        a callback raises: the thread would end, and with it every later
+        event and reconnect, while ``connected`` kept its last value.
+        """
+        if not callback:
+            return
+        try:
+            callback()
+        except Exception as exc:
+            _LOGGER.warning("MQTT %s callback error: %s", name, exc)
