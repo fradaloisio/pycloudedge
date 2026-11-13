@@ -1,11 +1,11 @@
-"""Timers of the P2P streaming loops (C106, C75, C83, C93, C87, C81, C72).
+"""Timers of the P2P streaming loops (C106, C75, C83, C93, C87, C81, C72, C92).
 
 The connection loop (_stream_with_turn) and the continuation receiver
 (_receive_stream) run against a scripted camera on a simulated clock.  The
 camera answers the VVP login, streams video frames, and then pauses, loses a
 segment or goes silent; the tests observe what the loops send (VVP STOP and
-START restarts, ICE checks, TURN renewals, session keepalives) and when the
-session ends.
+START restarts, ICE checks, TURN renewals, session keepalives), when they
+deliver a frame and when the session ends.
 """
 import struct
 from types import SimpleNamespace
@@ -51,9 +51,12 @@ class Camera:
         self.turn = turn
         self.next_keepalive = 0.0
 
-    def send(self, payload):
-        segment = push(self.sn, payload)
-        self.sn += 1
+    def send(self, *payloads):
+        # Several payloads share one UDP datagram, a KCP segment each.
+        segment = b""
+        for payload in payloads:
+            segment += push(self.sn, payload)
+            self.sn += 1
         if self.turn is None:
             return (segment, CAMERA_HOST, False)
         channel = self.turn.channels[CAMERA_RELAY]
@@ -471,3 +474,55 @@ def test_no_vvp_restart_before_the_first_video_frame(loop, receiver):
         )
 
     assert loop.turn.restarts() == []
+
+
+# ----------------------------------------------------------------------
+# C92 - messages that share a datagram with the camera's 0x7012 frame
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("keepalives", [1, 2])
+@pytest.mark.parametrize("receiver", ["connection", "continuation"])
+def test_a_frame_sharing_a_datagram_with_0x7012_frames_is_not_held_back(
+    loop, receiver, keepalives
+):
+    # The camera's 0x7012 frames and its last video frame arrive in one
+    # datagram, then the camera goes silent: the frame is delivered with
+    # that datagram, not with a later one that may never come.
+    camera = Camera()
+    shared_at = []
+
+    def script(t):
+        if camera.sn == 0 and receiver == "connection":
+            return [camera.login()]
+        if t < 5.0:
+            return [camera.send(video_frame())]
+        if not shared_at:
+            shared_at.append(t)
+            return [camera.send(*[iva_keepalive()] * keepalives, video_frame())]
+        return []
+
+    if receiver == "connection":
+        loop.connection(script, duration=15.0)
+    else:
+        camera.sn = 1
+        loop.continuation(script, duration=15.0)
+
+    # A datagram is handled 0.1 s after the script hands it over.
+    assert loop.frames[-1] == pytest.approx(shared_at[0] + 0.1, abs=0.01)
+
+
+def test_login_reply_sharing_a_datagram_with_the_0x7012_frame_is_detected(loop):
+    # The camera answers the IVA handshake and the VVP login in one datagram
+    # and sends nothing else: the login is not left for a later datagram.
+    camera = Camera()
+
+    def script(t):
+        if camera.sn == 0:
+            return [camera.send(iva_keepalive(), b"login-accepted")]
+        return []
+
+    loop.connection(script, duration=10.0)
+
+    # ICE checks are resent every 2 s only until the login.
+    assert loop.turn.direct_checks() == pytest.approx([0.0], abs=0.01)

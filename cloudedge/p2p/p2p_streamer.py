@@ -1469,6 +1469,20 @@ class P2PStreamer:
                 if qpayload:
                     _handle_stream_payload(qpayload)
 
+        def _next_queued_message():
+            """Pop the next queued KCP message that carries data.
+
+            IVA handshakes are passed over, and so are IVA frames that do
+            not parse (process_input drops those too).
+            """
+            while (queued := kcp.poll_data()) is not None:
+                if len(queued) >= 20 and queued[0] == 0xFF and queued[1] == 0x01:
+                    qiva = parse_iva_frame(queued)
+                    if not qiva or qiva[0] == 0x7012:
+                        continue
+                return queued
+            return None
+
         _packet_buf: deque = deque()
 
         while self._running and time.monotonic() < ice_deadline:
@@ -1758,7 +1772,12 @@ class P2PStreamer:
                                     direct_addr = matching.pop()
                             if direct_addr and direct_addr[0] != coturn_ip:
                                 direct_send_addrs.add(direct_addr)
-                    elif rtype == "data" and rdata:
+                        # The handshake was only the head of the queue: what
+                        # the same datagram completed behind it (the login
+                        # reply, media) is handled now, as this datagram's
+                        # data, instead of waiting for a later datagram.
+                        rtype, rdata = "data", _next_queued_message()
+                    if rtype == "data" and rdata:
                         payload = rdata
                         if len(rdata) >= 20 and rdata[0] == 0xFF and rdata[1] == 0x01:
                             iva = parse_iva_frame(rdata)
@@ -2159,6 +2178,9 @@ class P2PStreamer:
                     rtype, rdata = result
                     if rtype == "data" and rdata:
                         _process_kcp_message(rdata)
+                    # A handshake result is only the head of the queue: the
+                    # media the same datagram completed is queued behind it.
+                    if rtype == "handshake" or (rtype == "data" and rdata):
                         while True:
                             q = kcp.poll_data()
                             if not q:
