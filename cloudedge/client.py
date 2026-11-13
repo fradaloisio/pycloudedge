@@ -44,8 +44,9 @@ from .iot_parameters import (
 )
 from .constants import (
     APP_VERSION, APP_VERSION_CODE,
-    CA_KEY, CA_SECRET, DEFAULT_HEADERS, DEFAULT_TIMEOUT,
-    REDIRECT_URL, SESSION_INVALID_RESULT_CODES,
+    CA_KEY, CA_SECRET, DEFAULT_HEADERS, DEFAULT_LANGUAGE, DEFAULT_TIMEOUT,
+    IOT_TYPE, PHONE_TYPE, REDIRECT_URL, SDK_VERSION, SESSION_INVALID_RESULT_CODES,
+    SOURCE_APP,
 )
 from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
@@ -1072,13 +1073,13 @@ class CloudEdgeClient:
 
         phone_code_bare = self.phone_code.lstrip("+")
         params = {
-            "phoneType": "a",
-            "sourceApp": "8",
+            "phoneType": PHONE_TYPE,
+            "sourceApp": SOURCE_APP,
             "appVer": APP_VERSION,
             "appVerCode": APP_VERSION_CODE,
             "localTime": str(timestamp),
             "t": str(timestamp),
-            "lngType": "en",
+            "lngType": DEFAULT_LANGUAGE,
             "countryCode": self.country_code,
             "userAccount": encrypted_account,
             "phoneCode": phone_code_bare,
@@ -1227,35 +1228,30 @@ class CloudEdgeClient:
         # The app sends the dialling prefix without the leading "+"
         phone_code_bare = self.phone_code.lstrip("+")
         
-        # Create signature
-        ca_sign_data = (
-            f"phoneType=a&sourceApp=8&appVer={APP_VERSION}&iotType=4&equipmentNo= &"
-            f"appVerCode={APP_VERSION_CODE}&localTime={timestamp}&password={encrypted_password}&"
-            f"t={timestamp}&lngType=en&countryCode={self.country_code}&"
-            f"userAccount={encrypted_username}&encryStatus=1&"
-            f"phoneCode={phone_code_bare}"
-        )
-        ca_signature = base64.b64encode(
-            hmac.new(ca_key.encode(), ca_sign_data.encode(), hashlib.sha1).digest()
-        ).decode()
-        
         login_data = {
-            "phoneType": "a",
-            "sourceApp": "8",
+            "phoneType": PHONE_TYPE,
+            "sourceApp": SOURCE_APP,
             "appVer": APP_VERSION,
-            "iotType": "4",
+            "iotType": IOT_TYPE,
             "equipmentNo": " ",
             "appVerCode": APP_VERSION_CODE,
             "localTime": timestamp,
             "password": encrypted_password,
             "t": timestamp,
-            "lngType": "en",
+            "lngType": DEFAULT_LANGUAGE,
             "countryCode": self.country_code,
             "userAccount": encrypted_username,
             "encryStatus": "1",
             "phoneCode": phone_code_bare
         }
-        
+
+        # The signature covers the form fields in the order they are sent,
+        # unencoded.
+        ca_sign_data = "&".join(f"{key}={value}" for key, value in login_data.items())
+        ca_signature = base64.b64encode(
+            hmac.new(ca_key.encode(), ca_sign_data.encode(), hashlib.sha1).digest()
+        ).decode()
+
         headers = {
             "Accept-Language": "en-US,en;q=0.8",
             "User-Agent": "Mozilla/5.0 (Linux; U; Android 10; en-us; Android SDK built for arm64 Build/QSR1.211112.002) AppleWebKit/533.1 (KHTML, like Gecko) Version/5.0 Mobile Safari/533.1",
@@ -1385,11 +1381,12 @@ class CloudEdgeClient:
             ts = int(time.time() * 1000)
 
             params = {
-                'appVer': APP_VERSION, 'appVerCode': APP_VERSION_CODE, 'lngType': 'en',
-                'phoneType': 'a', 'sdkVer': '1.0.0', 'sourceApp': '8',
+                'appVer': APP_VERSION, 'appVerCode': APP_VERSION_CODE,
+                'lngType': DEFAULT_LANGUAGE, 'phoneType': PHONE_TYPE,
+                'sdkVer': SDK_VERSION, 'sourceApp': SOURCE_APP,
                 'countryCode': self.country_code,
                 'phoneCode': self.phone_code,
-                'iotType': '4',
+                'iotType': IOT_TYPE,
                 'signatureMethod': 'HMAC-SHA1', 'signatureVersion': '1.0',
                 'signatureNonce': str(ts),
                 't': str(ts), 'timestamp': str(ts),
@@ -1553,10 +1550,10 @@ class CloudEdgeClient:
         body = {
             'appVer': APP_VERSION,
             'appVerCode': APP_VERSION_CODE,
-            'lngType': 'en',
-            'phoneType': 'a',
-            'sdkVer': '1.0.0',
-            'sourceApp': '8',
+            'lngType': DEFAULT_LANGUAGE,
+            'phoneType': PHONE_TYPE,
+            'sdkVer': SDK_VERSION,
+            'sourceApp': SOURCE_APP,
             'userID': self.session_data['userID'],
             'userToken': self.session_data['userToken']
         }
@@ -1587,9 +1584,10 @@ class CloudEdgeClient:
         nonce = int(time.time())
         
         params_str = (
-            f"appVer={APP_VERSION}&appVerCode={APP_VERSION_CODE}&lngType=en&phoneType=a&"
+            f"appVer={APP_VERSION}&appVerCode={APP_VERSION_CODE}&"
+            f"lngType={DEFAULT_LANGUAGE}&phoneType={PHONE_TYPE}&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
-            f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
+            f"signatureVersion=1.0&sourceApp={SOURCE_APP}&timestamp={timestamp}&"
             f"userID={self.session_data['userID']}"
         )
         
@@ -1682,9 +1680,10 @@ class CloudEdgeClient:
         nonce = int(time.time())
         
         params_str = (
-            f"appVer={APP_VERSION}&appVerCode={APP_VERSION_CODE}&homeID={home_id}&lngType=en&phoneType=a&"
+            f"appVer={APP_VERSION}&appVerCode={APP_VERSION_CODE}&homeID={home_id}&"
+            f"lngType={DEFAULT_LANGUAGE}&phoneType={PHONE_TYPE}&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
-            f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
+            f"signatureVersion=1.0&sourceApp={SOURCE_APP}&timestamp={timestamp}&"
             f"userID={self.session_data['userID']}"
         )
         

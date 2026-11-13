@@ -23,7 +23,7 @@ from cloudedge import (
     NetworkError,
     RateLimitError,
 )
-from cloudedge.constants import CA_KEY
+from cloudedge.constants import APP_VERSION, APP_VERSION_CODE, CA_KEY
 from cloudedge.utils import parse_retry_after, retry_on_failure
 
 
@@ -562,12 +562,13 @@ def test_login_headers_and_signature_use_the_shared_ca_key(client):
     assert captured["headers"]["X-Ca-Key"] == CA_KEY
 
     # Reproduce the exact signature with the shared constant: the wire
-    # format is pinned, independent of how the key is spelled in code.
+    # format is pinned, independent of how the key is spelled in code. Only
+    # the emulated app version may change.
     data = captured["data"]
     timestamp = data["t"]
     ca_sign_data = (
-        f"phoneType=a&sourceApp=8&appVer=6.2.8&iotType=4&equipmentNo= &"
-        f"appVerCode=643&localTime={timestamp}&password={data['password']}&"
+        f"phoneType=a&sourceApp=8&appVer={APP_VERSION}&iotType=4&equipmentNo= &"
+        f"appVerCode={APP_VERSION_CODE}&localTime={timestamp}&password={data['password']}&"
         f"t={timestamp}&lngType=en&countryCode=IT&"
         f"userAccount={data['userAccount']}&encryStatus=1&"
         f"phoneCode=39"
