@@ -186,3 +186,24 @@ def test_first_fragmented_message_survives_reverse_datagram_order():
         while (message := tunnel.poll_data()) is not None:
             delivered.append(message)
     assert delivered == [b"first-middle-last"]
+
+
+def test_abandoned_fragmented_message_is_not_spliced_into_the_next_one():
+    # A camera can abandon a fragmented message it is still sending: the
+    # remaining fragments (frg=0 included) never get a sequence number, so
+    # sn stays contiguous while frg stops counting down (C110).
+    tunnel = KcpTunnel(lambda data: None)
+    fragments = [
+        (2, b"abandoned-"), (1, b"frame-"),  # of three: frg=0 never comes
+        (1, b"next-"), (0, b"frame"),        # a complete message of two
+        (0, b"single"),
+    ]
+    delivered = []
+    for sn, (frg, data) in enumerate(fragments):
+        packet = struct.pack("<IBBHIIII", 12, 81, frg, 1024, 0, sn, 0, len(data)) + data
+        result = tunnel.process_input(packet)
+        if result and result[0] == "data":
+            delivered.append(result[1])
+        while (message := tunnel.poll_data()) is not None:
+            delivered.append(message)
+    assert delivered == [b"next-frame", b"single"]
