@@ -802,12 +802,7 @@ class CloudEdgeClient:
                     last_refresh = getattr(self, "_last_openapi_auth_refresh", float("-inf"))
                     if attempt == 0 and now - last_refresh >= 60:
                         self._last_openapi_auth_refresh = now
-                        self._fetch_iot_config(force_refresh=True)
-                        self._save_session_cache(self.session_data)
-                        # Device signatures expire too; a stale one is rejected
-                        # with the same 401 as stale platform credentials.
-                        self._device_tokens.clear()
-                        self._refresh_device_tokens(force_refresh=True)
+                        self._renew_openapi_credentials(device_id, last_refresh)
                         continue
                     raise AuthenticationError("OpenAPI authorization rejected (401)")
                 if str(data.get("errid", 0)) != "0":
@@ -818,6 +813,36 @@ class CloudEdgeClient:
                                              details={"error_code": data["resultCode"]})
                 return response
             raise AuthenticationError("OpenAPI authorization rejected (401)")
+
+    def _renew_openapi_credentials(
+        self, rejected_device: Optional[str], last_refresh: float
+    ) -> None:
+        """Renew the platform keys and the device signatures after a 401.
+
+        Device signatures expire too; a stale one is rejected with the same
+        401 as stale platform credentials, so the rejected device's is
+        dropped and all are minted again. The other devices keep theirs
+        when the renewal cannot replace them, and a failed renewal does not
+        hold back the next one: otherwise one transient error would fail
+        every device's next requests as rejected credentials.
+        """
+        with self._state_lock:
+            kept = {
+                device: entry
+                for device, entry in self._device_tokens.items()
+                if device != rejected_device
+            }
+            try:
+                self._fetch_iot_config(force_refresh=True)
+                self._save_session_cache(self.session_data)
+                self._device_tokens.clear()
+                self._refresh_device_tokens(force_refresh=True)
+            except Exception:
+                self._last_openapi_auth_refresh = last_refresh
+                raise
+            finally:
+                for device, entry in kept.items():
+                    self._device_tokens.setdefault(device, entry)
 
     def _generate_timestamp(self) -> str:
         """Generate timestamp in CloudEdge format."""

@@ -7,7 +7,9 @@ from unittest.mock import Mock
 import pytest
 import requests
 
-from cloudedge import CloudEdgeClient, AuthenticationError, ConfigurationError
+from cloudedge import (
+    AuthenticationError, CloudEdgeClient, CloudEdgeError, ConfigurationError, NetworkError,
+)
 
 
 @pytest.fixture
@@ -184,3 +186,46 @@ def test_rejected_call_discards_stale_device_signatures(client):
 
     assert '0000000123456789' not in client._device_tokens
     assert client._refresh_device_tokens.called
+
+
+@pytest.mark.parametrize(
+    ('failure', 'raised'),
+    [(NetworkError('offline'), NetworkError),
+     (CloudEdgeError('bad inventory'), AuthenticationError)],
+    ids=['renewal-raises', 'renewal-logs'],
+)
+def test_failed_renewal_keeps_the_other_devices_signatures(client, failure, raised):
+    """A renewal that cannot list the devices must not cost every device its
+    signature: their next requests would all fail as rejected (C45)."""
+    client._device_tokens.update({
+        '0000000123456789': {'token': 'stale', 't': '1'},
+        '0000000987654321': {'token': 'other', 't': '2'},
+    })
+    denied = response({'errid': 401, 'errstr': 'Authorization Failed', 'reason': 'STError'})
+    client._make_request = Mock(return_value=denied)
+    client._fetch_iot_config = Mock()
+    client._collect_all_devices = Mock(side_effect=failure)
+
+    with pytest.raises(raised):
+        client.get_device_config('123456789')
+
+    assert client._device_tokens == {'0000000987654321': {'token': 'other', 't': '2'}}
+
+
+def test_failed_renewal_does_not_hold_back_the_next_one(client):
+    """After a transient failure the next rejection renews again, instead of
+    failing as rejected credentials for a minute (C45)."""
+    client._device_tokens.update({
+        '0000000123456789': {'token': 'stale', 't': '1'},
+        '0000000987654321': {'token': 'other', 't': '2'},
+    })
+    denied = response({'errid': 401, 'errstr': 'Authorization Failed', 'reason': 'STError'})
+    client._make_request = Mock(return_value=denied)
+    client._fetch_iot_config = Mock()
+    client._collect_all_devices = Mock(side_effect=NetworkError('offline'))
+
+    for serial in ('123456789', '987654321'):
+        with pytest.raises(NetworkError):
+            client.get_device_config(serial)
+
+    assert client._collect_all_devices.call_count == 2
