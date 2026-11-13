@@ -116,6 +116,21 @@ _APP_STREAMING_METADATA_FIELDS = {
 }
 
 
+def _raise_if_session_rejected(response_data: Dict[str, Any]) -> None:
+    """Raise AuthenticationError when the API rejected the session token.
+
+    The server rejects it when the account logged in elsewhere (one active
+    session per account): callers must re-authenticate instead of retrying
+    forever with a dead session.
+    """
+    error_code = response_data.get("resultCode", "unknown")
+    if str(error_code) in SESSION_INVALID_RESULT_CODES:
+        error_msg = response_data.get("resultMsg", "Unknown error")
+        raise AuthenticationError(
+            f"Session rejected by API (Code: {error_code}): {error_msg}"
+        )
+
+
 def _read_device_list(payload: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
     """Read an optional list without treating malformed inventory as empty."""
     devices = payload.get(key, [])
@@ -1381,6 +1396,7 @@ class CloudEdgeClient:
                 data = resp.json()
                 if data.get("resultCode") != "1001":
                     self._log(f"IoT config response: {data.get('resultCode')}")
+                    _raise_if_session_rejected(data)
                     return
 
                 pf = data.get("result", {}).get("pfApi", {})
@@ -1449,6 +1465,8 @@ class CloudEdgeClient:
                     f"MQTT config: {self.session_data['mqtt']['mqtt_host']}"
                     f":{self.session_data['mqtt']['mqtt_port']}"
                 )
+            except AuthenticationError:
+                raise
             except Exception as exc:
                 self._log(f"Failed to fetch IoT config: {_safe_exception_text(exc)}")
 
@@ -1598,14 +1616,7 @@ class CloudEdgeClient:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
                 self._log(f"API error - Code: {error_code}, Message: {error_msg}")
-                if str(error_code) in SESSION_INVALID_RESULT_CODES:
-                    # The server rejected our token (e.g. the account was
-                    # logged in elsewhere — one active session per account).
-                    # Raise the typed auth error so callers re-authenticate
-                    # instead of retrying forever with a dead session.
-                    raise AuthenticationError(
-                        f"Session rejected by API (Code: {error_code}): {error_msg}"
-                    )
+                _raise_if_session_rejected(response_data)
                 raise CloudEdgeError(
                     f"Failed to retrieve homes: {error_msg} (Code: {error_code})",
                     details={"error_code": error_code, "message": error_msg}
@@ -1712,10 +1723,7 @@ class CloudEdgeClient:
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
-                if str(error_code) in SESSION_INVALID_RESULT_CODES:
-                    raise AuthenticationError(
-                        f"Session rejected by API (Code: {error_code}): {error_msg}"
-                    )
+                _raise_if_session_rejected(response_data)
                 raise CloudEdgeError(
                     f"Failed to retrieve home devices: {error_msg} (Code: {error_code})",
                     details={"error_code": error_code, "message": error_msg, "home_id": home_id}
@@ -1945,10 +1953,7 @@ class CloudEdgeClient:
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
-                if str(error_code) in SESSION_INVALID_RESULT_CODES:
-                    raise AuthenticationError(
-                        f"Session rejected by API (Code: {error_code}): {error_msg}"
-                    )
+                _raise_if_session_rejected(response_data)
                 raise CloudEdgeError(
                     f"Failed to retrieve devices: {error_msg}",
                     details={"error_code": error_code, "message": error_msg}
@@ -2025,6 +2030,7 @@ class CloudEdgeClient:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
                 self._log(f"Failed to get device status: {error_msg}")
+                _raise_if_session_rejected(response_data)
                 raise CloudEdgeError(
                     f"Failed to get device status: {error_msg}",
                     details={"error_code": error_code, "device_id": device_id}

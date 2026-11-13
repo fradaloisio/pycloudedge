@@ -330,6 +330,25 @@ class TestSessionInvalidHandling:
             with pytest.raises(AuthenticationError):
                 client.get_devices_by_home("home-id")
 
+    def test_get_device_status_raises_authentication_error_for_invalid_session(self):
+        client = self._authenticated_client()
+
+        with patch.object(
+            client, "_make_request", return_value=self._session_invalid_response()
+        ):
+            with pytest.raises(AuthenticationError):
+                client.get_device_status("device-id")
+
+    def test_iot_config_fetch_raises_authentication_error_for_invalid_session(self):
+        # Other failures of this fetch stay non-fatal (C46).
+        client = self._authenticated_client()
+
+        with patch.object(
+            client._session, "get", return_value=self._session_invalid_response()
+        ):
+            with pytest.raises(AuthenticationError):
+                client._fetch_iot_config(force_refresh=True)
+
     def test_get_all_devices_does_not_swallow_authentication_error(self):
         client = self._authenticated_client()
 
