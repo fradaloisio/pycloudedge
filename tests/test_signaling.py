@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 from Crypto.Cipher import DES3
 
-from cloudedge.p2p import p2p_streamer
+from cloudedge.p2p import meari_signaling, p2p_streamer
 from cloudedge.p2p.meari_signaling import MsgSvrClient
 from cloudedge.p2p.p2p_streamer import P2PStreamer
 
@@ -154,6 +154,33 @@ def test_status_push_before_a_reply_is_queued_for_the_next_status_waiter():
     # consumes it without reading the (now empty) socket.
     online = sig.wait_for_status(DEVICE_UUID, "online", timeout=1)
     assert online is not None and online["status"] == "online"
+
+
+@pytest.mark.parametrize(
+    "wakes", [True, False], ids=["status-arrives", "deadline-passes"]
+)
+def test_waiting_for_a_status_leaves_the_socket_timeout_as_it_was(monkeypatch, wakes):
+    # The wait sets its own timeout for each read; left on the socket it
+    # applies to every later signaling reply (C78).
+    now = [1000.0]
+    monkeypatch.setattr(meari_signaling, "time", SimpleNamespace(time=lambda: now[0]))
+
+    class _TimedTcp(ScriptedTcp):
+        def recv(self, size):
+            try:
+                return super().recv(size)
+            except socket.timeout:
+                now[0] += self.timeout  # a blocking read waits its timeout out
+                raise
+
+    sig = connected_client()
+    sig.sock = _TimedTcp(initial=status_push("online") if wakes else b"")
+    sig.sock.settimeout(10.0)
+
+    status = sig.wait_for_status(DEVICE_UUID, "online", timeout=30)
+
+    assert (status is not None) is wakes
+    assert sig.sock.gettimeout() == 10.0
 
 
 class _RecordingTurn:

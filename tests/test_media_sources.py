@@ -6,7 +6,7 @@ advertised candidates (any port of a host/srflx candidate IP, by explicit
 rule) and peers that proved they are the ICE peer; the TURN socket only from
 the TURN server.  Production loops run against scripted datagrams on a
 simulated clock; STUN messages are built independently of the production
-encoder.
+encoder.  A relayed ICE check that names no IPv4 peer is ignored (C76).
 """
 import collections
 import hashlib
@@ -389,6 +389,60 @@ def test_a_forged_data_indication_cannot_redirect_the_bootstrap(media, caplog):
     # The bootstrap is still retried on the negotiated TURN candidate.
     assert [at for at in media.turn.kcp_pushes("relay", CAMERA_RELAY) if at > 100.0]
     assert "unexpected source 192.168.1.66:40000" in caplog.text
+
+
+# ----------------------------------------------------------------------
+# C76 - relayed ICE checks that name no IPv4 peer
+# ----------------------------------------------------------------------
+
+# XOR-PEER-ADDRESS of family 2: port 5555 and a 16-byte address.
+IPV6_PEER = struct.pack(">HHBBH", 0x0012, 20, 0, 2, 5555 ^ (MAGIC >> 16)) + bytes(16)
+
+
+@pytest.mark.parametrize("peer_address", [b"", IPV6_PEER], ids=["missing", "ipv6"])
+@pytest.mark.parametrize("receiver", ["connection", "continuation"])
+def test_relayed_ice_check_without_an_ipv4_peer_does_not_end_the_session(
+    media, monkeypatch, receiver, peer_address
+):
+    # The answer to a relayed check goes to the indication's XOR-PEER-ADDRESS.
+    # The TURN client cannot encode a reply to no address or to an IPv6 one,
+    # and its error used to end the session.  The production encoder runs
+    # here on the scripted TURN.
+    monkeypatch.setattr(
+        ScriptedTurn, "send_to_peer", turn_client.TurnClient.send_to_peer
+    )
+    monkeypatch.setattr(ScriptedTurn, "_send", lambda self, frame: None, raising=False)
+    phase = {"continuation": False}
+    receive_stream = P2PStreamer._receive_stream
+
+    def continuation(self, *args, **kwargs):
+        phase["continuation"] = True
+        return receive_stream(self, *args, **kwargs)
+
+    monkeypatch.setattr(P2PStreamer, "_receive_stream", continuation)
+    check = stun(0x0001, b"camera-check")
+    data = struct.pack(">HH", 0x0013, len(check)) + check
+    indication = stun(0x0017, b"relayed-chck", peer_address + data)
+    sn = [0]
+    frames_before_check = []
+
+    def script(tick, sig):
+        if receiver == "continuation" and tick > 20 and not phase["continuation"]:
+            return []  # the camera pauses until the continuation receiver runs
+        payload = b"login-accepted" if sn[0] == 0 else video_frame()
+        batch = [(push(sn[0], payload), CAMERA_HOST, False)]
+        sn[0] += 1
+        if not frames_before_check and sn[0] > 5 and (
+            receiver == "connection" or phase["continuation"]
+        ):
+            frames_before_check.append(len(media.frames))
+            batch.append((indication, SERVER, True))
+        return batch
+
+    media.run(script, duration=45.0 if receiver == "continuation" else 10.0)
+
+    assert frames_before_check, "the check reached the loop under test"
+    assert len(media.frames) > frames_before_check[0] + 50, "the session went on"
 
 
 # ----------------------------------------------------------------------

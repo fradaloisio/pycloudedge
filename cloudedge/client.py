@@ -2521,9 +2521,10 @@ class CloudEdgeClient:
         devices = self.get_all_devices()
         
         name = device_name.lower()
-        matches = [device for device in devices if device.get("name", "").lower() == name]
+        # A device listed with a null deviceName has name None.
+        matches = [device for device in devices if (device.get("name") or "").lower() == name]
         if not matches:
-            matches = [device for device in devices if name in device.get("name", "").lower()]
+            matches = [device for device in devices if name in (device.get("name") or "").lower()]
         if len(matches) > 1:
             raise DeviceNotFoundError(
                 f"Device name '{device_name}' is ambiguous; use a unique device name",

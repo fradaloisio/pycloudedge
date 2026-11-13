@@ -1643,6 +1643,14 @@ class P2PStreamer:
                             )
                         inner_msg = _parse_stun(inner_data)
                         if inner_msg and inner_msg["type"] == BINDING_REQUEST:
+                            if pip is None or pport is None:
+                                # No XOR-PEER-ADDRESS, or an IPv6 one: there
+                                # is no peer to answer through the relay.
+                                _LOGGER.debug(
+                                    "Ignoring relayed ICE check without an "
+                                    "IPv4 peer address"
+                                )
+                                continue
                             resp = _build_ice_response(inner_msg, ice_pwd, pip, pport)
                             try:
                                 turn.send_to_peer(pip, pport, resp)
@@ -2107,6 +2115,14 @@ class P2PStreamer:
                             and inner_msg["type"] == BINDING_REQUEST
                             and ice_pwd
                         ):
+                            if pip is None or pport is None:
+                                # No XOR-PEER-ADDRESS, or an IPv6 one: there
+                                # is no peer to answer through the relay.
+                                _LOGGER.debug(
+                                    "Ignoring relayed ICE check without an "
+                                    "IPv4 peer address"
+                                )
+                                continue
                             resp = _build_ice_response(inner_msg, ice_pwd, pip, pport)
                             try:
                                 turn.send_to_peer(pip, pport, resp)

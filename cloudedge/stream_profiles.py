@@ -107,7 +107,11 @@ def _parse_profile_value(value: Any) -> Dict[str, Any]:
     profile["width"] = int(match.group(1))
     profile["height"] = int(match.group(2))
     if match.group(3):
-        fps = float(match.group(3))
+        try:
+            fps = float(match.group(3))
+        except ValueError:
+            # Malformed fps such as "1.2.3": the resolution is still usable.
+            return profile
         profile["fps"] = int(fps) if fps.is_integer() else fps
     return profile
 
