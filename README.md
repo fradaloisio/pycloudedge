@@ -123,7 +123,7 @@ Optional dependencies:
 ```python
 import os
 from dotenv import load_dotenv
-from pycloudedge import CloudEdgeClient
+from cloudedge import CloudEdgeClient
 
 def main():
     # Initialize the client
@@ -169,7 +169,7 @@ if __name__ == "__main__":
 ### Multi-Home Device Management
 
 ```python
-from pycloudedge import CloudEdgeClient
+from cloudedge import CloudEdgeClient
 
 def manage_multi_home():
     client = CloudEdgeClient("user@example.com", "password", "US", "+1")
@@ -198,7 +198,7 @@ manage_multi_home()
 ### Device Control
 
 ```python
-from pycloudedge import CloudEdgeClient
+from cloudedge import CloudEdgeClient
 
 def control_devices():
     client = CloudEdgeClient("user@example.com", "password", "US", "+1")
@@ -241,7 +241,7 @@ Then use environment variables in your code:
 ```python
 import os
 from dotenv import load_dotenv
-from pycloudedge import CloudEdgeClient
+from cloudedge import CloudEdgeClient
 
 load_dotenv()
 
@@ -511,7 +511,7 @@ The library includes comprehensive IoT parameter definitions for CloudEdge devic
 ### Parameter Helper Functions
 
 ```python
-from pycloudedge import get_parameter_name, format_parameter_value
+from cloudedge import get_parameter_name, format_parameter_value
 
 # Get human-readable name from code
 name = get_parameter_name("167")  # Returns "FRONT_LIGHT_SWITCH"
@@ -525,7 +525,7 @@ formatted = format_parameter_value("BATTERY_PERCENT", 85)  # Returns "85%"
 The library provides specific exception types for different error conditions:
 
 ```python
-from pycloudedge import (
+from cloudedge import (
     CloudEdgeClient, 
     AuthenticationError, 
     DeviceNotFoundError, 
