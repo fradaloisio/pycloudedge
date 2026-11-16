@@ -1,6 +1,9 @@
 include README.md
+include CHANGELOG.md
+include RELEASE.md
 include LICENSE
 include requirements.txt
+include requirements-dev.txt
 include .env.example
 recursive-include cloudedge *.py
 recursive-include examples *.py *.md

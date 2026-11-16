@@ -585,12 +585,25 @@ mypy cloudedge/
 
 ### Building and Publishing
 
-```bash
-# Build the package
-python -m build
+See [Release preparation](RELEASE.md) for the 0.1.13 candidate build, installed
+artifact checks and the coordinated release with CloudEdge Home Assistant 1.5.0.
+The version comes from Git tags through `setuptools_scm`; do not edit the
+generated `cloudedge/_version.py` file.
 
-# Upload to PyPI (requires API token)
-twine upload dist/*
+```bash
+# Prepare a local candidate before creating the release tag; this does not publish.
+SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYCLOUDEDGE=0.1.13 python -m build --outdir dist-staging/0.1.13
+python -m twine check --strict dist-staging/0.1.13/*
+```
+
+After release approval, create the `v0.1.13` tag on the approved commit, build
+again from a clean checkout of that tag without the version override, and
+validate those artifacts before uploading:
+
+```bash
+python -m build
+python -m twine check --strict dist/*
+# Publication is a separate, approved step; see RELEASE.md.
 ```
 
 ## Troubleshooting

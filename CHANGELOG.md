@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.13
+
+Fixes fragmented video, MQTT listener lifecycle and authentication recovery after temporary credential-renewal failures. This is the library required by CloudEdge Home Assistant 1.5.0.
 
 Changes:
 - Fix corrupt video frames when a camera abandons a fragmented message: its fragments are no longer joined to the next message.
@@ -9,6 +11,8 @@ Changes:
 - A renewal of the OpenAPI credentials that fails (for example on a network error) no longer drops every device's signature, and no longer holds the next renewal back for a minute: one transient error used to fail the other devices' requests as rejected credentials.
 - `get_device_status()` and `refresh_mqtt_config()` raise `AuthenticationError` when the server rejects the session (code 1023), as the home and device lists already did.
 - Fix the README examples: import `cloudedge`, the package that `pip install pycloudedge` installs.
+
+Requires Python 3.10 or newer. No public API changes are required for existing callers.
 
 ## 0.1.12
 
