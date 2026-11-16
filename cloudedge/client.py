@@ -43,8 +43,10 @@ from .iot_parameters import (
     format_parameter_value
 )
 from .constants import (
-    CA_KEY, CA_SECRET, DEFAULT_HEADERS, DEFAULT_TIMEOUT,
-    REDIRECT_URL, SESSION_INVALID_RESULT_CODES,
+    APP_VERSION, APP_VERSION_CODE,
+    CA_KEY, CA_SECRET, DEFAULT_HEADERS, DEFAULT_LANGUAGE, DEFAULT_TIMEOUT,
+    IOT_TYPE, PHONE_TYPE, REDIRECT_URL, SDK_VERSION, SESSION_INVALID_RESULT_CODES,
+    SOURCE_APP,
 )
 from .validators import validate_email, validate_country_code, validate_phone_code
 from .logging_config import get_logger
@@ -113,6 +115,21 @@ _APP_STREAMING_METADATA_FIELDS = {
     "as_friend": "asFriend",
     "device_region": "region",
 }
+
+
+def _raise_if_session_rejected(response_data: Dict[str, Any]) -> None:
+    """Raise AuthenticationError when the API rejected the session token.
+
+    The server rejects it when the account logged in elsewhere (one active
+    session per account): callers must re-authenticate instead of retrying
+    forever with a dead session.
+    """
+    error_code = response_data.get("resultCode", "unknown")
+    if str(error_code) in SESSION_INVALID_RESULT_CODES:
+        error_msg = response_data.get("resultMsg", "Unknown error")
+        raise AuthenticationError(
+            f"Session rejected by API (Code: {error_code}): {error_msg}"
+        )
 
 
 def _read_device_list(payload: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
@@ -786,12 +803,7 @@ class CloudEdgeClient:
                     last_refresh = getattr(self, "_last_openapi_auth_refresh", float("-inf"))
                     if attempt == 0 and now - last_refresh >= 60:
                         self._last_openapi_auth_refresh = now
-                        self._fetch_iot_config(force_refresh=True)
-                        self._save_session_cache(self.session_data)
-                        # Device signatures expire too; a stale one is rejected
-                        # with the same 401 as stale platform credentials.
-                        self._device_tokens.clear()
-                        self._refresh_device_tokens(force_refresh=True)
+                        self._renew_openapi_credentials(device_id, last_refresh)
                         continue
                     raise AuthenticationError("OpenAPI authorization rejected (401)")
                 if str(data.get("errid", 0)) != "0":
@@ -802,6 +814,36 @@ class CloudEdgeClient:
                                              details={"error_code": data["resultCode"]})
                 return response
             raise AuthenticationError("OpenAPI authorization rejected (401)")
+
+    def _renew_openapi_credentials(
+        self, rejected_device: Optional[str], last_refresh: float
+    ) -> None:
+        """Renew the platform keys and the device signatures after a 401.
+
+        Device signatures expire too; a stale one is rejected with the same
+        401 as stale platform credentials, so the rejected device's is
+        dropped and all are minted again. The other devices keep theirs
+        when the renewal cannot replace them, and a failed renewal does not
+        hold back the next one: otherwise one transient error would fail
+        every device's next requests as rejected credentials.
+        """
+        with self._state_lock:
+            kept = {
+                device: entry
+                for device, entry in self._device_tokens.items()
+                if device != rejected_device
+            }
+            try:
+                self._fetch_iot_config(force_refresh=True)
+                self._save_session_cache(self.session_data)
+                self._device_tokens.clear()
+                self._refresh_device_tokens(force_refresh=True)
+            except Exception:
+                self._last_openapi_auth_refresh = last_refresh
+                raise
+            finally:
+                for device, entry in kept.items():
+                    self._device_tokens.setdefault(device, entry)
 
     def _generate_timestamp(self) -> str:
         """Generate timestamp in CloudEdge format."""
@@ -1031,13 +1073,13 @@ class CloudEdgeClient:
 
         phone_code_bare = self.phone_code.lstrip("+")
         params = {
-            "phoneType": "a",
-            "sourceApp": "8",
-            "appVer": "6.2.8",
-            "appVerCode": "643",
+            "phoneType": PHONE_TYPE,
+            "sourceApp": SOURCE_APP,
+            "appVer": APP_VERSION,
+            "appVerCode": APP_VERSION_CODE,
             "localTime": str(timestamp),
             "t": str(timestamp),
-            "lngType": "en",
+            "lngType": DEFAULT_LANGUAGE,
             "countryCode": self.country_code,
             "userAccount": encrypted_account,
             "phoneCode": phone_code_bare,
@@ -1186,35 +1228,30 @@ class CloudEdgeClient:
         # The app sends the dialling prefix without the leading "+"
         phone_code_bare = self.phone_code.lstrip("+")
         
-        # Create signature
-        ca_sign_data = (
-            f"phoneType=a&sourceApp=8&appVer=6.2.8&iotType=4&equipmentNo= &"
-            f"appVerCode=643&localTime={timestamp}&password={encrypted_password}&"
-            f"t={timestamp}&lngType=en&countryCode={self.country_code}&"
-            f"userAccount={encrypted_username}&encryStatus=1&"
-            f"phoneCode={phone_code_bare}"
-        )
-        ca_signature = base64.b64encode(
-            hmac.new(ca_key.encode(), ca_sign_data.encode(), hashlib.sha1).digest()
-        ).decode()
-        
         login_data = {
-            "phoneType": "a",
-            "sourceApp": "8",
-            "appVer": "6.2.8",
-            "iotType": "4",
+            "phoneType": PHONE_TYPE,
+            "sourceApp": SOURCE_APP,
+            "appVer": APP_VERSION,
+            "iotType": IOT_TYPE,
             "equipmentNo": " ",
-            "appVerCode": "643",
+            "appVerCode": APP_VERSION_CODE,
             "localTime": timestamp,
             "password": encrypted_password,
             "t": timestamp,
-            "lngType": "en",
+            "lngType": DEFAULT_LANGUAGE,
             "countryCode": self.country_code,
             "userAccount": encrypted_username,
             "encryStatus": "1",
             "phoneCode": phone_code_bare
         }
-        
+
+        # The signature covers the form fields in the order they are sent,
+        # unencoded.
+        ca_sign_data = "&".join(f"{key}={value}" for key, value in login_data.items())
+        ca_signature = base64.b64encode(
+            hmac.new(ca_key.encode(), ca_sign_data.encode(), hashlib.sha1).digest()
+        ).decode()
+
         headers = {
             "Accept-Language": "en-US,en;q=0.8",
             "User-Agent": "Mozilla/5.0 (Linux; U; Android 10; en-us; Android SDK built for arm64 Build/QSR1.211112.002) AppleWebKit/533.1 (KHTML, like Gecko) Version/5.0 Mobile Safari/533.1",
@@ -1344,11 +1381,12 @@ class CloudEdgeClient:
             ts = int(time.time() * 1000)
 
             params = {
-                'appVer': '6.2.8', 'appVerCode': '643', 'lngType': 'en',
-                'phoneType': 'a', 'sdkVer': '1.0.0', 'sourceApp': '8',
+                'appVer': APP_VERSION, 'appVerCode': APP_VERSION_CODE,
+                'lngType': DEFAULT_LANGUAGE, 'phoneType': PHONE_TYPE,
+                'sdkVer': SDK_VERSION, 'sourceApp': SOURCE_APP,
                 'countryCode': self.country_code,
                 'phoneCode': self.phone_code,
-                'iotType': '4',
+                'iotType': IOT_TYPE,
                 'signatureMethod': 'HMAC-SHA1', 'signatureVersion': '1.0',
                 'signatureNonce': str(ts),
                 't': str(ts), 'timestamp': str(ts),
@@ -1380,6 +1418,7 @@ class CloudEdgeClient:
                 data = resp.json()
                 if data.get("resultCode") != "1001":
                     self._log(f"IoT config response: {data.get('resultCode')}")
+                    _raise_if_session_rejected(data)
                     return
 
                 pf = data.get("result", {}).get("pfApi", {})
@@ -1448,6 +1487,8 @@ class CloudEdgeClient:
                     f"MQTT config: {self.session_data['mqtt']['mqtt_host']}"
                     f":{self.session_data['mqtt']['mqtt_port']}"
                 )
+            except AuthenticationError:
+                raise
             except Exception as exc:
                 self._log(f"Failed to fetch IoT config: {_safe_exception_text(exc)}")
 
@@ -1507,12 +1548,12 @@ class CloudEdgeClient:
             raise AuthenticationError("Not authenticated")
             
         body = {
-            'appVer': '6.2.8',
-            'appVerCode': '643',
-            'lngType': 'en',
-            'phoneType': 'a',
-            'sdkVer': '1.0.0',
-            'sourceApp': '8',
+            'appVer': APP_VERSION,
+            'appVerCode': APP_VERSION_CODE,
+            'lngType': DEFAULT_LANGUAGE,
+            'phoneType': PHONE_TYPE,
+            'sdkVer': SDK_VERSION,
+            'sourceApp': SOURCE_APP,
             'userID': self.session_data['userID'],
             'userToken': self.session_data['userToken']
         }
@@ -1543,9 +1584,10 @@ class CloudEdgeClient:
         nonce = int(time.time())
         
         params_str = (
-            f"appVer=6.2.8&appVerCode=643&lngType=en&phoneType=a&"
+            f"appVer={APP_VERSION}&appVerCode={APP_VERSION_CODE}&"
+            f"lngType={DEFAULT_LANGUAGE}&phoneType={PHONE_TYPE}&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
-            f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
+            f"signatureVersion=1.0&sourceApp={SOURCE_APP}&timestamp={timestamp}&"
             f"userID={self.session_data['userID']}"
         )
         
@@ -1597,14 +1639,7 @@ class CloudEdgeClient:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
                 self._log(f"API error - Code: {error_code}, Message: {error_msg}")
-                if str(error_code) in SESSION_INVALID_RESULT_CODES:
-                    # The server rejected our token (e.g. the account was
-                    # logged in elsewhere — one active session per account).
-                    # Raise the typed auth error so callers re-authenticate
-                    # instead of retrying forever with a dead session.
-                    raise AuthenticationError(
-                        f"Session rejected by API (Code: {error_code}): {error_msg}"
-                    )
+                _raise_if_session_rejected(response_data)
                 raise CloudEdgeError(
                     f"Failed to retrieve homes: {error_msg} (Code: {error_code})",
                     details={"error_code": error_code, "message": error_msg}
@@ -1645,9 +1680,10 @@ class CloudEdgeClient:
         nonce = int(time.time())
         
         params_str = (
-            f"appVer=6.2.8&appVerCode=643&homeID={home_id}&lngType=en&phoneType=a&"
+            f"appVer={APP_VERSION}&appVerCode={APP_VERSION_CODE}&homeID={home_id}&"
+            f"lngType={DEFAULT_LANGUAGE}&phoneType={PHONE_TYPE}&"
             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
-            f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
+            f"signatureVersion=1.0&sourceApp={SOURCE_APP}&timestamp={timestamp}&"
             f"userID={self.session_data['userID']}"
         )
         
@@ -1711,10 +1747,7 @@ class CloudEdgeClient:
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
-                if str(error_code) in SESSION_INVALID_RESULT_CODES:
-                    raise AuthenticationError(
-                        f"Session rejected by API (Code: {error_code}): {error_msg}"
-                    )
+                _raise_if_session_rejected(response_data)
                 raise CloudEdgeError(
                     f"Failed to retrieve home devices: {error_msg} (Code: {error_code})",
                     details={"error_code": error_code, "message": error_msg, "home_id": home_id}
@@ -1944,10 +1977,7 @@ class CloudEdgeClient:
             else:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
-                if str(error_code) in SESSION_INVALID_RESULT_CODES:
-                    raise AuthenticationError(
-                        f"Session rejected by API (Code: {error_code}): {error_msg}"
-                    )
+                _raise_if_session_rejected(response_data)
                 raise CloudEdgeError(
                     f"Failed to retrieve devices: {error_msg}",
                     details={"error_code": error_code, "message": error_msg}
@@ -2024,6 +2054,7 @@ class CloudEdgeClient:
                 error_msg = response_data.get('resultMsg', 'Unknown error')
                 error_code = response_data.get('resultCode', 'unknown')
                 self._log(f"Failed to get device status: {error_msg}")
+                _raise_if_session_rejected(response_data)
                 raise CloudEdgeError(
                     f"Failed to get device status: {error_msg}",
                     details={"error_code": error_code, "device_id": device_id}
@@ -2520,9 +2551,10 @@ class CloudEdgeClient:
         devices = self.get_all_devices()
         
         name = device_name.lower()
-        matches = [device for device in devices if device.get("name", "").lower() == name]
+        # A device listed with a null deviceName has name None.
+        matches = [device for device in devices if (device.get("name") or "").lower() == name]
         if not matches:
-            matches = [device for device in devices if name in device.get("name", "").lower()]
+            matches = [device for device in devices if name in (device.get("name") or "").lower()]
         if len(matches) > 1:
             raise DeviceNotFoundError(
                 f"Device name '{device_name}' is ambiguous; use a unique device name",

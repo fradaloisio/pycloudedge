@@ -488,18 +488,23 @@ class MsgSvrClient:
                     and data.get("status", "") == target):
                 return data
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            self.sock.settimeout(max(1, deadline - time.time()))
-            try:
-                resp = self._recv()
-                data = resp["json"]
-                if (data.get("action") == "status" and
-                        data.get("uuid") == device_uuid):
-                    status = data.get("status", "")
-                    if status == target:
-                        return data
-            except socket.timeout:
-                continue
+        # The per-read timeout set below must not outlive the wait.
+        previous_timeout = self.sock.gettimeout()
+        try:
+            while time.time() < deadline:
+                self.sock.settimeout(max(1, deadline - time.time()))
+                try:
+                    resp = self._recv()
+                    data = resp["json"]
+                    if (data.get("action") == "status" and
+                            data.get("uuid") == device_uuid):
+                        status = data.get("status", "")
+                        if status == target:
+                            return data
+                except socket.timeout:
+                    continue
+        finally:
+            self.sock.settimeout(previous_timeout)
         return None
 
     def close(self):

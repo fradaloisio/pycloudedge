@@ -154,6 +154,18 @@ def test_profile_key_four_stays_selectable_below_lower_keys():
     assert select_live_stream_id(device, prefer_low=True) == 104
 
 
+def test_malformed_profile_fps_does_not_break_stream_selection():
+    # "640x360@1.2.3": the fps is unusable, but the profile is still a
+    # stream the camera offers and keeps its resolution (C48).
+    device = {"bps2": {"0": "2304x1296@15", "2": "640x360@1.2.3"}}
+
+    assert get_available_live_stream_ids(device) == [100, 102]
+    assert select_live_stream_id(device, prefer_low=True) == 102
+    malformed = get_live_stream_profiles(device)[1]
+    assert (malformed["width"], malformed["height"]) == (640, 360)
+    assert "fps" not in malformed
+
+
 def test_bitrate_mask_without_usable_bits_falls_back_to_legacy_streams():
     device = {"bps": 1 << 10}
 

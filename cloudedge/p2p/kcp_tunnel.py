@@ -225,6 +225,8 @@ class KcpTunnel:
         # safety-net gap skip is used, discard through the next frg=0 boundary
         # instead of delivering a truncated media frame.
         self._discard_until_message_end = False
+        # frg of the last fragment appended to recv_frag_buf.
+        self._last_frg = None
 
         # Deferred ACK queue: list of (sn, ts) to send in batch
         self.pending_acks = []
@@ -416,7 +418,19 @@ class KcpTunnel:
                     self._discard_until_message_end = False
                 continue
 
+            # A message's fragments count down by exactly one. Any other frg
+            # means the sender abandoned the message in progress (its
+            # remaining fragments, frg=0 included, never got a sequence
+            # number), so this fragment starts a new message. Joining them
+            # would splice several media frames into one corrupt payload.
+            if self.recv_frag_buf and frg != self._last_frg - 1:
+                _LOGGER.debug(
+                    "KCP message abandoned after %s fragments (frg %s -> %s)",
+                    len(self.recv_frag_buf), self._last_frg, frg,
+                )
+                self.recv_frag_buf = []
             self.recv_frag_buf.append(data)
+            self._last_frg = frg
             if frg == 0:
                 messages.append(b"".join(self.recv_frag_buf))
                 self.recv_frag_buf = []

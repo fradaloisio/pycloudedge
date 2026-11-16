@@ -25,6 +25,7 @@ SOURCE_APP = "8"
 APP_VERSION = "6.2.8"
 IOT_TYPE = "4"
 APP_VERSION_CODE = "643"
+SDK_VERSION = "1.0.0"
 DEFAULT_LANGUAGE = "en"
 
 # Timeout values (seconds)

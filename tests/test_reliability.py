@@ -295,6 +295,19 @@ def test_exact_name_takes_precedence_over_partial_match(client):
     assert client.find_device_by_name("camera") == exact
 
 
+def test_devices_without_a_name_do_not_break_the_search_by_name(client):
+    # A device listed with a null deviceName has name None (C47).
+    named = {"name": "Porch", "serial_number": "sn"}
+    client.get_all_devices = Mock(return_value=[
+        {"name": None, "serial_number": "sn-null"},
+        {"serial_number": "sn-missing"},
+        named,
+    ])
+    assert client.find_device_by_name("porch") == named
+    assert client.find_device_by_name("por") == named
+    assert client.find_device_by_name("garage") is None
+
+
 def test_password_encryption_matches_independent_3des_implementation(client):
     import base64
     from Crypto.Cipher import DES

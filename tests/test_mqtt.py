@@ -1,6 +1,7 @@
 import json
 import logging
 import ssl
+import sys
 
 import pytest
 
@@ -50,7 +51,8 @@ def test_mqtt_payloads_are_logged_only_at_debug(caplog):
 
 
 class _FakePahoClient:
-    """Stands in for paho's Client: records credentials, never connects."""
+    """Stands in for paho's Client: records credentials and whether its
+    network loop runs, never connects."""
 
     instances = []
 
@@ -59,6 +61,7 @@ class _FakePahoClient:
         self.on_disconnect = None
         self.keepalive = None
         self.reconnect_delay = None
+        self.loop_running = False
         _FakePahoClient.instances.append(self)
 
     def username_pw_set(self, username, password=None):
@@ -76,11 +79,14 @@ class _FakePahoClient:
     def connect_async(self, host, port, keepalive=60):
         self.keepalive = keepalive
 
-    def loop_start(self):
+    def subscribe(self, topic, qos=0):
         pass
 
+    def loop_start(self):
+        self.loop_running = True
+
     def loop_stop(self):
-        pass
+        self.loop_running = False
 
     def disconnect(self):
         # paho >= 2 reports a deliberate disconnect through on_disconnect,
@@ -100,13 +106,28 @@ class _RenewingConfigClient(_MqttConfigClient):
                 "mqtt_access_id": "renewed-id", "mqtt_signature": "renewed-signature"}
 
 
-def _started_listener(monkeypatch, client):
+def _started_listener(monkeypatch, client, **callbacks):
     pytest.importorskip("paho.mqtt.client")
     monkeypatch.setattr("paho.mqtt.client.Client", _FakePahoClient)
     _FakePahoClient.instances.clear()
-    listener = CloudEdgeMqttListener(client)
+    listener = CloudEdgeMqttListener(client, **callbacks)
     assert listener.start() is True
     return listener, _FakePahoClient.instances[-1]
+
+
+def _connack_success(paho):
+    """Report an accepted connection the way paho 2.x does."""
+    from paho.mqtt.client import ConnectFlags
+    from paho.mqtt.packettypes import PacketTypes
+    from paho.mqtt.reasoncodes import ReasonCode
+
+    paho.on_connect(
+        paho,
+        None,
+        ConnectFlags(session_present=False),
+        ReasonCode(PacketTypes.CONNACK, "Success"),
+        None,
+    )
 
 
 def test_reconnect_uses_broker_credentials_renewed_by_the_client(monkeypatch):
@@ -195,3 +216,104 @@ def test_mqtt_debug_logs_omit_signed_snapshot_urls(caplog):
 
     assert events and events[0][4]["url"] == url  # still delivered to callbacks
     assert "SIG-SECRET" not in caplog.text
+
+
+def test_starting_twice_keeps_one_live_connection(monkeypatch):
+    """A second start() left the first paho client running under the same
+    client id (C52): the broker hands the session back and forth between
+    the two, and stop() only reaches the newer one."""
+    listener, _ = _started_listener(monkeypatch, _RenewingConfigClient())
+
+    assert listener.start() is True
+
+    live = [paho for paho in _FakePahoClient.instances if paho.loop_running]
+    assert len(live) == 1
+    # Still a started listener: a drop picks up the renewed credentials.
+    live[0].on_disconnect(live[0], None, None, 5, None)
+    assert live[0].credentials[-1] == ("renewed-id", "renewed-signature")
+
+    listener.stop()
+    assert not any(paho.loop_running for paho in _FakePahoClient.instances)
+
+
+@pytest.mark.parametrize("failing", ["on_connect", "on_disconnect"])
+def test_a_failing_host_callback_stays_out_of_the_paho_thread(
+    monkeypatch, caplog, failing
+):
+    """paho 2.x re-raises what a callback raises in its network thread,
+    which then ends: no more events or reconnects, whatever ``connected``
+    says (C53). A host callback error is logged and the listener carries on."""
+
+    def host_bug():
+        raise RuntimeError("host bug")
+
+    listener, paho = _started_listener(
+        monkeypatch, _MqttConfigClient(), **{failing: host_bug}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cloudedge.mqtt"):
+        _connack_success(paho)
+        assert listener.connected is True
+        paho.on_disconnect(paho, None, None, 7, None)
+        assert listener.connected is False
+
+    assert "host bug" in caplog.text
+
+
+@pytest.mark.parametrize("hook", ["on_event", "on_motion"])
+def test_a_typeerror_inside_a_callback_does_not_run_it_twice(caplog, hook):
+    """Like the Home Assistant handler, this callback takes ``extra=None``:
+    retrying with four arguments on any TypeError ran it a second time (C54)."""
+    calls = []
+
+    def handler(device_id, event_name, event_type, is_motion, extra=None):
+        calls.append(extra)
+        raise TypeError("bug inside the handler")
+
+    listener = CloudEdgeMqttListener(_MqttConfigClient(), **{hook: handler})
+
+    with caplog.at_level(logging.DEBUG, logger="cloudedge.mqtt"):
+        listener._dispatch(b'{"evt": "2", "deviceID": "camera-id"}')
+
+    assert calls == [{}], "called once, in the extended form"
+    assert caplog.text.count("bug inside the handler") == 1
+
+
+def test_callbacks_get_the_event_in_the_form_their_signature_takes():
+    """Four-argument callbacks predate ``extra`` and must keep working."""
+    legacy, extended = [], []
+    listener = CloudEdgeMqttListener(
+        _MqttConfigClient(),
+        on_event=lambda device_id, name, kind, motion: legacy.append(
+            (device_id, name, kind, motion)
+        ),
+        on_motion=lambda device_id, name, kind, motion, extra: extended.append(
+            (device_id, name, kind, motion, extra)
+        ),
+    )
+
+    listener._dispatch(b'{"evt": "2", "deviceID": "camera-id", "deviceName": "Door"}')
+
+    assert legacy == [("camera-id", "Motion", 2, True)]
+    assert extended == [("camera-id", "Motion", 2, True, {"deviceName": "Door"})]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 14), reason="annotations are evaluated lazily from 3.14"
+)
+def test_callback_annotated_with_a_type_checking_only_name_still_gets_events():
+    """Reading such a signature raises NameError from Python 3.14: the
+    callback is still called once, in the extended form."""
+    received = []
+
+    def handler(
+        device_id, event_name, event_type, is_motion,
+        extra: OnlyForTypeCheckers = None,  # noqa: F821
+    ):
+        received.append(extra)
+
+    listener = CloudEdgeMqttListener(_MqttConfigClient(), on_event=handler)
+
+    listener._dispatch(b'{"evt": "2", "deviceID": "camera-id"}')
+
+    assert received == [{}]
